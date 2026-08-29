@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -lm
 
-SRC = main.c tensor.c kv_cache.c quant.c gguf.c
+SRC = main.c tensor.c kv_cache.c quant.c gguf.c model.c
 OBJ = $(SRC:.c=.o)
 TARGET = mini_llama
 
