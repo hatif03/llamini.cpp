@@ -66,6 +66,18 @@ void swiglu(f32* out, const f32* gate, const f32* up, u32 dim);
 void rope(f32* q, f32* k, u32 pos, u32 dim, u32 head_dim);
 
 /**
+ * @brief Causal Multi-Head Attention with built-in KV Cache read/write logic
+ * @param q Current token query tensor
+ * @param k Current token key tensor
+ * @param v Current token value tensor
+ * @param cache Global pre-allocated KV Cache storage
+ * @param out Aggregated attention output tensor
+ * @param pos Current sequence position index of this token
+ * @param n_heads Total number of parallel attention heads
+ */
+void causal_mha(Tensor* q, Tensor* k, Tensor* v, KVCache* cache, Tensor* out, u32 pos, u32 n_heads);
+
+/**
  * @brief Initialize empty LLaMA model & allocate all tensor memory buffers
  * @param model Pointer to empty LLaMAModel struct
  * @param cfg Model hyperparameter configuration

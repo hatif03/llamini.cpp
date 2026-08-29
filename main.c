@@ -104,20 +104,15 @@ void test_swiglu()
     printf("\n");
 }
 
-/**
- * Unit test for RoPE rotary positional encoding transformation
- */
 void test_rope()
 {
     printf("\n[RoPE Rotary Positional Encoding Test]\n");
-    // Short test vector, total dim = 8, single head dim = 8
     f32 q[] = {1, 0, 1, 0, 1, 0, 1, 0};
     f32 k[] = {1, 0, 1, 0, 1, 0, 1, 0};
     u32 pos = 5;
     u32 dim = 8;
     u32 head_dim = 8;
-    
-    // Apply RoPE transformation to Q and K vectors
+
     rope(q, k, pos, dim, head_dim);
 
     printf("Rotated Q vector: ");
@@ -127,15 +122,64 @@ void test_rope()
     printf("\n");
 }
 
+/**
+ * Unit test for Causal Multi-Head Attention with KV Cache
+ */
+void test_causal_mha()
+{
+    // Print unit test header to console
+    printf("\n[Causal Multi-Head Attention Unit Test]\n");
+    // Define tensor shape: single token, hidden dimension = 8
+    u32 vec_shape[] = {1, 8};
+    // Allocate tensor for query vector
+    Tensor* q = tensor_create(2, vec_shape);
+    // Allocate tensor for key vector
+    Tensor* k = tensor_create(2, vec_shape);
+    // Allocate tensor for value vector
+    Tensor* v = tensor_create(2, vec_shape);
+    // Allocate tensor to store attention output result
+    Tensor* out = tensor_create(2, vec_shape);
+
+    // Fill sequential numeric test data to Q/K/V tensors
+    for(u32 i = 0; i < 8; i++){
+        q->data[i] = (f32)i;
+        k->data[i] = (f32)i;
+        v->data[i] = (f32)i;
+    }
+
+    // Declare KV Cache storage structure
+    KVCache cache;
+    // Initialize KV Cache with hidden dim 8 and max sequence length
+    kv_cache_init(&cache, 8, MAX_SEQ_LEN);
+
+    // Run causal MHA forward pass for token at position 0, single attention head
+    causal_mha(q, k, v, &cache, out, 0, 1);
+    // Print computed attention output vector of position 0
+    printf("Attention output at pos 0: ");
+    for(int i = 0; i < 8; i++){
+        printf("%.2f ", out->data[i]);
+    }
+    printf("\n");
+
+    // Free dynamically allocated tensor memory to avoid memory leaks
+    tensor_free(q);
+    tensor_free(k);
+    tensor_free(v);
+    tensor_free(out);
+    // Clear all cached key and value states for next test
+    kv_cache_reset(&cache);
+}
+
 int main(int argc, char** argv)
 {
-    printf("===== Section 7: RoPE Positional Encoding Full Test Suite =====\n");
+    printf("===== Section 8: Causal Multi-Head Attention Full Test Suite =====\n");
     test_matmul();
     test_kv_cache();
     test_int4_quant();
     test_rms_norm();
     test_swiglu();
     test_rope();
+    test_causal_mha();
 
     if (argc >= 2)
     {

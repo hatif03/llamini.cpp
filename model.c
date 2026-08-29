@@ -40,6 +40,48 @@ void rope(f32* q, f32* k, u32 pos, u32 dim, u32 head_dim)
 }
 
 /**
+ * Causal Multi-Head Attention with KV Cache
+ * Simplified teaching implementation, single aggregated output for demo chat engine
+ * Automatically saves current K/V to cache and computes attention over all past tokens
+ */
+void causal_mha(Tensor* q, Tensor* k, Tensor* v, KVCache* cache, Tensor* out, u32 pos, u32 n_heads)
+{
+    u32 dim = q->dims[1];
+    u32 head_dim = dim / n_heads;
+
+    // Step 1: Write current token's Key and Value into KV Cache buffer
+    memcpy(cache->key + pos * dim, k->data, dim * sizeof(f32));
+    memcpy(cache->val + pos * dim, v->data, dim * sizeof(f32));
+    // Update cache counter to record new stored token
+    cache->cur_seq = pos + 1;
+
+    // Step 2: Clear output buffer to zero before weighted accumulation
+    memset(out->data, 0, out->size * sizeof(f32));
+
+    // Step 3: Iterate ALL historical cached tokens (causal rule: t from 0 to current pos only)
+    for (u32 t = 0; t <= pos; t++)
+    {
+        f32 raw_score = 0.0f;
+        // Dot product between current Query and cached Key at position t
+        for (u32 d = 0; d < dim; d++)
+        {
+            raw_score += q->data[d] * (cache->key + t * dim)[d];
+        }
+
+        // Step 4: Scale attention score to avoid extreme large values
+        f32 scaled_score = raw_score / sqrtf((f32)head_dim);
+        // Softmax weight via exponential function
+        f32 attn_weight = expf(scaled_score);
+
+        // Step 5: Weighted sum of cached Value vector, accumulate into output
+        for (u32 d = 0; d < dim; d++)
+        {
+            out->data[d] += attn_weight * (cache->val + t * dim)[d];
+        }
+    }
+}
+
+/**
  * RMSNorm Vector Normalization
  * No mean subtraction; only root-mean-square scaling + learnable weight
  */
