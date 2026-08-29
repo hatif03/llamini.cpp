@@ -4,6 +4,8 @@
 #include "quant.h"
 #include "gguf.h"
 #include "model.h"
+#include "tokenizer.h"
+#include "generate.h"
 
 void test_matmul()
 {
@@ -122,57 +124,121 @@ void test_rope()
     printf("\n");
 }
 
-/**
- * Unit test for Causal Multi-Head Attention with KV Cache
- */
 void test_causal_mha()
 {
-    // Print unit test header to console
     printf("\n[Causal Multi-Head Attention Unit Test]\n");
-    // Define tensor shape: single token, hidden dimension = 8
     u32 vec_shape[] = {1, 8};
-    // Allocate tensor for query vector
     Tensor* q = tensor_create(2, vec_shape);
-    // Allocate tensor for key vector
     Tensor* k = tensor_create(2, vec_shape);
-    // Allocate tensor for value vector
     Tensor* v = tensor_create(2, vec_shape);
-    // Allocate tensor to store attention output result
     Tensor* out = tensor_create(2, vec_shape);
 
-    // Fill sequential numeric test data to Q/K/V tensors
     for(u32 i = 0; i < 8; i++){
         q->data[i] = (f32)i;
         k->data[i] = (f32)i;
         v->data[i] = (f32)i;
     }
 
-    // Declare KV Cache storage structure
     KVCache cache;
-    // Initialize KV Cache with hidden dim 8 and max sequence length
     kv_cache_init(&cache, 8, MAX_SEQ_LEN);
 
-    // Run causal MHA forward pass for token at position 0, single attention head
     causal_mha(q, k, v, &cache, out, 0, 1);
-    // Print computed attention output vector of position 0
     printf("Attention output at pos 0: ");
     for(int i = 0; i < 8; i++){
         printf("%.2f ", out->data[i]);
     }
     printf("\n");
 
-    // Free dynamically allocated tensor memory to avoid memory leaks
     tensor_free(q);
     tensor_free(k);
     tensor_free(v);
     tensor_free(out);
-    // Clear all cached key and value states for next test
+    kv_cache_reset(&cache);
+}
+
+/**
+ * Unit test for text <-> token conversion
+ * Test the full tokenizer encode and decode workflow
+ */
+void test_tokenizer()
+{
+    // Print test section title on console
+    printf("\n[Tokenizer Unit Test]\n");
+    // Sample input sentence for tokenization test
+    const char* prompt = "hello world how are you";
+    // Buffer to store converted integer token IDs
+    u32 tokens[64];
+    // Convert plain text string into token ID array
+    u32 token_cnt = text_to_tokens(prompt, tokens, 64);
+    // Print original input text and total number of generated tokens
+    printf("Input text: %s\nToken count: %u\nToken IDs: ", prompt, token_cnt);
+    // Loop to print every token ID in sequence
+    for(u32 i = 0; i < token_cnt; i++)
+        printf("%u ", tokens[i]);
+    printf("\n");
+
+    // Demo of token decoding: convert single token ID back to readable word
+    char buf[32];
+    // Decode the second token (index 1, BOS is index 0)
+    token_to_text(tokens[1], buf, 32);
+    // Print decoded text matched with corresponding token ID
+    printf("Token %u decode text: %s\n", tokens[1], buf);
+}
+
+/**
+ * End-to-end autoregressive generation test
+ * Full pipeline test: tokenizer -> model forward -> autoregressive token generation
+ */
+void test_autoregressive_generate()
+{
+    // Print test section header for generation pipeline
+    printf("\n[Autoregressive Generation End-To-End Test]\n");
+    // Static hyperparameter configuration matching TinyLlama official setting
+    LLaMAConfig cfg = {
+        .dim = 512,          // Model hidden embedding dimension
+        .n_layers = 22,      // Total number of transformer decoder layers
+        .n_heads = 32,       // Number of multi-head attention heads
+        .vocab_size = 32000, // Total vocabulary size of LLaMA tokenizer
+        .seq_len = MAX_SEQ_LEN // Maximum supported context sequence length
+    };
+    // Declare main LLM model instance
+    LLaMAModel model;
+    // Initialize all model tensors and layers with above config
+    llama_model_init(&model, &cfg);
+
+    // Declare KV cache instance for fast generation
+    KVCache cache;
+    // Allocate memory for key/value cache storage
+    kv_cache_init(&cache, cfg.dim, cfg.seq_len);
+
+    // Raw user input prompt for chat test
+    const char* user_prompt = "hello llama";
+    // Buffer to hold encoded input prompt token IDs
+    u32 input_tokens[256];
+    // Convert input text into token sequence
+    u32 in_cnt = text_to_tokens(user_prompt, input_tokens, 256);
+
+    // Output buffer storing full prompt + newly generated tokens
+    u32 output_tokens[512];
+    // Run complete autoregressive generation, limit max 10 newly generated tokens
+    u32 total = generate_autoregressive(&model, &cache, input_tokens, in_cnt, output_tokens, 10);
+
+    // Print total length of combined prompt + generated token sequence
+    printf("Generated total token length: %u\nToken sequence: ", total);
+    // Print every token ID in the full output sequence
+    for(u32 i = 0; i < total; i++)
+        printf("%u ", output_tokens[i]);
+    printf("\n");
+
+    // Release all dynamically allocated memory of model tensors
+    llama_model_free(&model);
+    // Clear all cached attention key and value data
     kv_cache_reset(&cache);
 }
 
 int main(int argc, char** argv)
 {
-    printf("===== Section 8: Causal Multi-Head Attention Full Test Suite =====\n");
+    printf("===== Section 9: Tokenizer & Autoregressive Generation Full Test Suite =====\n");
     test_matmul();
     test_kv_cache();
     test_int4_quant();
@@ -180,6 +246,8 @@ int main(int argc, char** argv)
     test_swiglu();
     test_rope();
     test_causal_mha();
+    test_tokenizer();
+    test_autoregressive_generate();
 
     if (argc >= 2)
     {
