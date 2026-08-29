@@ -1,10 +1,9 @@
 #include "model.h"
-#include "gguf.h" // 放在这里才正确
 
-void rms_norm(f32* out, const f32* x, const f32* w, u32 dim) {
+void rms_norm(f32* out, const f32* x, const f32* w, u32 dim, f32 eps) {
     f32 sum_sq = 0.0f;
     for (u32 i = 0; i < dim; i++) sum_sq += x[i] * x[i];
-    f32 rms = sqrtf(sum_sq / dim + EPS);
+    f32 rms = sqrtf(sum_sq / dim + eps);
     f32 inv_rms = 1.0f / rms;
     for (u32 i = 0; i < dim; i++) out[i] = x[i] * inv_rms * w[i];
 }
@@ -16,38 +15,85 @@ void swiglu(f32* out, const f32* gate, const f32* up, u32 dim) {
     }
 }
 
-void rope(f32* q, f32* k, u32 pos, u32 dim, u32 head_dim) {
+void rope(f32* vec, u32 pos, u32 dim, u32 head_dim, f32 freq_base) {
     for (u32 i = 0; i < dim; i += 2) {
-        f32 theta = powf(10000.0f, -(f32)(i % head_dim) / (f32)head_dim);
+        f32 theta = powf(freq_base, -(f32)(i % head_dim) / (f32)head_dim);
         f32 cos_t = cosf(pos * theta);
         f32 sin_t = sinf(pos * theta);
 
-        f32 q0 = q[i]; f32 q1 = q[i+1];
-        q[i] = q0 * cos_t - q1 * sin_t;
-        q[i+1] = q0 * sin_t + q1 * cos_t;
-
-        f32 k0 = k[i]; f32 k1 = k[i+1];
-        k[i] = k0 * cos_t - k1 * sin_t;
-        k[i+1] = k0 * sin_t + k1 * cos_t;
+        f32 v0 = vec[i]; f32 v1 = vec[i + 1];
+        vec[i]     = v0 * cos_t - v1 * sin_t;
+        vec[i + 1] = v0 * sin_t + v1 * cos_t;
     }
 }
 
-void causal_mha(Tensor* q, Tensor* k, Tensor* v, KVCache* cache, Tensor* out, u32 pos, u32 n_heads) {
-    u32 dim = q->dims[1];
-    u32 head_dim = dim / n_heads;
+void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim) {
+    for (u32 o = 0; o < out_dim; o++) {
+        f32 sum = 0.0f;
+        const f32* row = w + (u64)o * in_dim;
+        for (u32 i = 0; i < in_dim; i++) sum += row[i] * x[i];
+        out[o] = sum;
+    }
+}
 
-    memcpy(cache->key + pos * dim, q->data, dim * sizeof(f32));
-    memcpy(cache->val + pos * dim, v->data, dim * sizeof(f32));
+void causal_mha(const f32* q, const f32* k, const f32* v, KVCache* cache,
+                 f32* out, u32 pos, u32 n_heads, u32 n_heads_kv, u32 head_dim) {
+    u32 kv_dim = n_heads_kv * head_dim;
+    u32 group = n_heads / n_heads_kv; // query heads sharing one KV head
+
+    memcpy(cache->key + (u64)pos * kv_dim, k, kv_dim * sizeof(f32));
+    memcpy(cache->val + (u64)pos * kv_dim, v, kv_dim * sizeof(f32));
     cache->cur_seq = pos + 1;
 
-    memset(out->data, 0, out->size * sizeof(f32));
-    for (u32 t = 0; t <= pos; t++) {
-        f32 score = 0.0f;
-        for (u32 d = 0; d < dim; d++) score += q->data[d] * (cache->key + t * dim)[d];
-        score /= sqrtf((f32)head_dim);
-        f32 exp_s = expf(score);
-        for (u32 d = 0; d < dim; d++) out->data[d] += exp_s * (cache->val + t * dim)[d];
+    // ponytail: scores buffer sized to MAX_SEQ_LEN so this never allocates
+    // per call; pos < cfg.seq_len <= MAX_SEQ_LEN is enforced at config load.
+    static f32 scores[MAX_SEQ_LEN];
+
+    for (u32 h = 0; h < n_heads; h++) {
+        u32 kvh = h / group;
+        const f32* qh = q + (u64)h * head_dim;
+
+        f32 max_score = -1e30f;
+        for (u32 t = 0; t <= pos; t++) {
+            const f32* kt = cache->key + (u64)t * kv_dim + (u64)kvh * head_dim;
+            f32 score = 0.0f;
+            for (u32 d = 0; d < head_dim; d++) score += qh[d] * kt[d];
+            score /= sqrtf((f32)head_dim);
+            scores[t] = score;
+            if (score > max_score) max_score = score;
+        }
+        f32 sum_exp = 0.0f;
+        for (u32 t = 0; t <= pos; t++) {
+            scores[t] = expf(scores[t] - max_score);
+            sum_exp += scores[t];
+        }
+        f32* oh = out + (u64)h * head_dim;
+        memset(oh, 0, head_dim * sizeof(f32));
+        for (u32 t = 0; t <= pos; t++) {
+            f32 w = scores[t] / sum_exp;
+            const f32* vt = cache->val + (u64)t * kv_dim + (u64)kvh * head_dim;
+            for (u32 d = 0; d < head_dim; d++) oh[d] += w * vt[d];
+        }
     }
+}
+
+LLaMAConfig llama_config_from_gguf(GGUFFile* gf, LLaMAConfig defaults) {
+    LLaMAConfig cfg = defaults;
+    cfg.dim        = gguf_get_u32(gf, "llama.embedding_length", cfg.dim);
+    cfg.n_layers    = gguf_get_u32(gf, "llama.block_count", cfg.n_layers);
+    cfg.n_heads      = gguf_get_u32(gf, "llama.attention.head_count", cfg.n_heads);
+    cfg.n_heads_kv    = gguf_get_u32(gf, "llama.attention.head_count_kv", cfg.n_heads);
+    cfg.ffn_dim        = gguf_get_u32(gf, "llama.feed_forward_length", cfg.ffn_dim);
+    cfg.rms_eps          = gguf_get_f32(gf, "llama.attention.layer_norm_rms_epsilon", cfg.rms_eps);
+    cfg.rope_freq_base    = gguf_get_f32(gf, "llama.rope.freq_base", cfg.rope_freq_base);
+
+    u32 ctx_len = gguf_get_u32(gf, "llama.context_length", cfg.seq_len);
+    cfg.seq_len = ctx_len < MAX_SEQ_LEN ? ctx_len : MAX_SEQ_LEN;
+
+    u64 vocab_n = gguf_meta_array_len(gf, "tokenizer.ggml.tokens", NULL);
+    if (vocab_n > 0) cfg.vocab_size = (u32)vocab_n;
+
+    return cfg;
 }
 
 int llama_model_init(LLaMAModel* model, LLaMAConfig* cfg) {
@@ -56,14 +102,35 @@ int llama_model_init(LLaMAModel* model, LLaMAConfig* cfg) {
     model->layers = (DecoderLayer*)calloc(cfg->n_layers, sizeof(DecoderLayer));
     if (!model->layers) return -1;
 
-    u32 emb_shape[] = {cfg->vocab_size, cfg->dim};
+    u32 dim = cfg->dim, ffn = cfg->ffn_dim;
+    u32 head_dim = dim / cfg->n_heads;
+    u32 kv_dim = cfg->n_heads_kv * head_dim;
+
+    u32 emb_shape[]  = {cfg->vocab_size, dim};
     model->embeddings = tensor_create(2, emb_shape);
-
-    u32 norm_shape[] = {1, cfg->dim};
+    u32 norm_shape[] = {1, dim};
     model->final_norm = tensor_create(2, norm_shape);
-
-    u32 head_shape[] = {cfg->dim, cfg->vocab_size};
+    u32 head_shape[] = {cfg->vocab_size, dim};
     model->lm_head = tensor_create(2, head_shape);
+
+    for (u32 l = 0; l < cfg->n_layers; l++) {
+        DecoderLayer* layer = &model->layers[l];
+        u32 s_norm[]  = {1, dim};
+        u32 s_qo[]    = {dim, dim};
+        u32 s_kv[]    = {kv_dim, dim};
+        u32 s_gateup[] = {ffn, dim};
+        u32 s_down[]   = {dim, ffn};
+
+        layer->attn_norm = tensor_create(2, s_norm);
+        layer->q_proj    = tensor_create(2, s_qo);
+        layer->k_proj    = tensor_create(2, s_kv);
+        layer->v_proj    = tensor_create(2, s_kv);
+        layer->o_proj    = tensor_create(2, s_qo);
+        layer->ffn_norm  = tensor_create(2, s_norm);
+        layer->gate_proj = tensor_create(2, s_gateup);
+        layer->up_proj   = tensor_create(2, s_gateup);
+        layer->down_proj = tensor_create(2, s_down);
+    }
 
     return 0;
 }
@@ -73,13 +140,63 @@ void llama_model_free(LLaMAModel* model) {
     tensor_free(model->embeddings);
     tensor_free(model->final_norm);
     tensor_free(model->lm_head);
-    if (model->layers) free(model->layers);
+    if (model->layers) {
+        for (u32 l = 0; l < model->cfg.n_layers; l++) {
+            DecoderLayer* layer = &model->layers[l];
+            tensor_free(layer->attn_norm);
+            tensor_free(layer->q_proj);
+            tensor_free(layer->k_proj);
+            tensor_free(layer->v_proj);
+            tensor_free(layer->o_proj);
+            tensor_free(layer->ffn_norm);
+            tensor_free(layer->gate_proj);
+            tensor_free(layer->up_proj);
+            tensor_free(layer->down_proj);
+        }
+        free(model->layers);
+    }
     memset(model, 0, sizeof(LLaMAModel));
 }
 
+// Dequantizes the named tensor directly into `t`'s pre-allocated buffer.
+// Returns -1 (without touching `t`) if the tensor is missing, its element
+// count doesn't match, or its ggml_type isn't one this reader supports.
+static int load_tensor(GGUFFile* gf, const char* name, Tensor* t) {
+    const GGUFTensorInfo* info = gguf_find_tensor(gf, name);
+    if (!info) return -1;
+    return gguf_dequantize_tensor(gf, info, t->data, t->size);
+}
+
 int llama_load_weights(LLaMAModel* model, GGUFFile* gf) {
-    u32 dim = model->cfg.dim;
-    u64 offset = 0;
-    gguf_read_f32(gf, offset, model->embeddings->data, model->embeddings->size);
+    if (load_tensor(gf, "token_embd.weight", model->embeddings) != 0) return -1;
+    if (load_tensor(gf, "output_norm.weight", model->final_norm) != 0) return -1;
+    // Some checkpoints tie the output projection to the input embeddings
+    // and only ship token_embd.weight; fall back to it if output.weight
+    // is absent rather than failing a load that would actually work.
+    if (load_tensor(gf, "output.weight", model->lm_head) != 0 &&
+        load_tensor(gf, "token_embd.weight", model->lm_head) != 0) return -1;
+
+    char name[64];
+    for (u32 l = 0; l < model->cfg.n_layers; l++) {
+        DecoderLayer* layer = &model->layers[l];
+        snprintf(name, sizeof(name), "blk.%u.attn_norm.weight", l);
+        if (load_tensor(gf, name, layer->attn_norm) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.attn_q.weight", l);
+        if (load_tensor(gf, name, layer->q_proj) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.attn_k.weight", l);
+        if (load_tensor(gf, name, layer->k_proj) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.attn_v.weight", l);
+        if (load_tensor(gf, name, layer->v_proj) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.attn_output.weight", l);
+        if (load_tensor(gf, name, layer->o_proj) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.ffn_norm.weight", l);
+        if (load_tensor(gf, name, layer->ffn_norm) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", l);
+        if (load_tensor(gf, name, layer->gate_proj) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.ffn_up.weight", l);
+        if (load_tensor(gf, name, layer->up_proj) != 0) return -1;
+        snprintf(name, sizeof(name), "blk.%u.ffn_down.weight", l);
+        if (load_tensor(gf, name, layer->down_proj) != 0) return -1;
+    }
     return 0;
 }

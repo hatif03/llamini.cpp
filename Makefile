@@ -5,7 +5,7 @@ CC = gcc
 CFLAGS = -Wall -O2 -std=c99 -lm
 
 # All source files
-SRC = main.c tensor.c model.c gguf.c kv_cache.c quant.c
+SRC = main.c tensor.c model.c gguf.c kv_cache.c quant.c tokenizer.c generate.c
 
 # Convert .c to .o
 OBJ = $(SRC:.c=.o)

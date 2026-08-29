@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <ctype.h>
+#include <assert.h>
 
 #define MAX_DIM        4096
 #define MAX_SEQ_LEN    2048
@@ -21,8 +22,10 @@
 
 typedef float          f32;
 typedef unsigned char  u8;
+typedef signed char    i8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
+typedef int            i32;
 typedef unsigned long long u64;
 
 #define TOKEN_BOS  1

@@ -1,0 +1,28 @@
+---
+description: C99 and POSIX stdlib conventions for llamini.cpp
+globs: "**/*.{c,h}"
+alwaysApply: false
+---
+
+# C99 / POSIX
+
+This repo is C99, not C++. No `.cpp`, no `std::`, no templates.
+
+Allowed headers: `stdio.h`, `stdlib.h`, `string.h`, `math.h`, `ctype.h`, `time.h`, `unistd.h`, `fcntl.h`, `sys/types.h`, `sys/stat.h`, `sys/mman.h`, `pthread.h` if needed, `strings.h` (POSIX).
+
+Forbidden: Boost, fmt, ggml, OpenSSL, any path under `vendor/` or `third_party/`.
+
+- Use typedefs from `common.h` (`f32`, `u8`, `u16`, `u32`, `u64`).
+- Load GGUF with POSIX `open` + `fstat` + `mmap` + `memcpy`, same as `gguf.c`.
+- One concern per `.c` / `.h` pair. Match existing names (`tensor_create`, `gguf_open`).
+- Tests: in-process `--test` + `printf`. No test package.
+
+```c
+/* BAD */
+#include <ggml.h>
+float *w = load_with_lib(path);
+
+/* GOOD */
+gf->fd = open(path, O_RDONLY);
+gf->data = mmap(NULL, gf->size, PROT_READ, MAP_PRIVATE, gf->fd, 0);
+```

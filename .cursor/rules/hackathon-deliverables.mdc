@@ -1,0 +1,14 @@
+---
+description: Zero Dependency hackathon Track F deliverable checklist
+alwaysApply: true
+---
+
+# Hackathon deliverables
+
+Track F (Open / Wildcard): a mini llama.cpp people assume needs ggml / llama.cpp / sentencepiece.
+
+- One command builds: `make` → `mini_llama`. Do not invent `package.json`, `Cargo.toml`, `vcpkg.json`, or `conanfile`.
+- C empty manifest = no vcpkg / Conan / CMake FetchContent / vendored libs.
+- README: what it does, how to run (`make` + `./mini_llama model.gguf`), honest limits (stubs named).
+- STDLIB.md: real stdlib-for-package substitutions, not empty bullets.
+- When those files are in scope, use the `hackathon-submit` skill. Do not flatten into a single file unless the user asks.

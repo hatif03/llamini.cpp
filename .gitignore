@@ -1,0 +1,38 @@
+# Build
+*.o
+*.obj
+*.exe
+mini_llama
+mini_llama.exe
+a.out
+*.pdb
+*.ilk
+*.dSYM/
+
+# Model weights
+*.gguf
+*.ggml
+*.bin
+*.safetensors
+models/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Cursor local-only (keep rules and skills)
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
+!.cursor/skills/
+!.cursor/skills/**
+
+# Claude local-only
+.claude/settings.local.json
+.claude/*.local.*
+
+# Compiler / cache
+compile_commands.json
+.cache/
