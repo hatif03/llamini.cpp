@@ -3,7 +3,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -lm
 
 # Source file list
-SRC = main.c tensor.c
+SRC = main.c tensor.c kv_cache.c
 OBJ = $(SRC:.c=.o)
 TARGET = mini_llama
 

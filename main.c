@@ -1,5 +1,6 @@
 #include "common.h"
 #include "tensor.h"
+#include "kv_cache.h"
 
 /**
  * Unit test for matrix multiplication core tensor math
@@ -38,10 +39,30 @@ void test_matmul()
     tensor_free(C);
 }
 
+/**
+ * Unit test to verify KV Cache init and reset logic
+ */
+void test_kv_cache()
+{
+    printf("\n[KV Cache Unit Test]\n");
+    KVCache cache;
+    // Initialize cache with hidden dim 512, max sequence from global macro
+    kv_cache_init(&cache, 512, MAX_SEQ_LEN);
+
+    // Simulate storing 10 tokens
+    cache.cur_seq = 10;
+    printf("Cached token count before reset: %u\n", cache.cur_seq);
+
+    // Execute full cache reset
+    kv_cache_reset(&cache);
+    printf("Cached token count after reset: %u\n", cache.cur_seq);
+}
+
 int main(int argc, char** argv)
 {
-    printf("===== Section 2: Tensor System Unit Test =====\n");
+    printf("===== Section 3: Tensor + KV Cache Unit Test =====\n");
     test_matmul();
-    printf("\nAll tensor tests finished without error.\n");
+    test_kv_cache();
+    printf("\nAll tests finished without error.\n");
     return 0;
 }
