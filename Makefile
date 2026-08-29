@@ -2,8 +2,8 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -lm
 
-# Source file list
-SRC = main.c tensor.c kv_cache.c
+# Source file list (add quant.c from this section)
+SRC = main.c tensor.c kv_cache.c quant.c
 OBJ = $(SRC:.c=.o)
 TARGET = mini_llama
 
