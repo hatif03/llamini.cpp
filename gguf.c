@@ -1,5 +1,17 @@
 #include "gguf.h"
 
+// Sane upper bounds on counts read straight from a user-supplied (untrusted)
+// file, so a corrupt or hostile GGUF fails gguf_open() cleanly instead of
+// attempting a pathological allocation or letting an overflowed length
+// survive into a later read. These are generous relative to any real model
+// file (TinyLlama-1.1B-Chat has 201 tensors, 23 metadata entries, a 32000-
+// entry vocab array) -- they exist to catch "the file is lying", not to
+// constrain legitimate files.
+#define GGUF_MAX_KV      (1u << 16)
+#define GGUF_MAX_TENSORS (1u << 20)
+#define GGUF_MAX_ARRAY   (1ull << 26)
+#define GGUF_MAX_STR     (1u << 20)
+
 // ================================================================
 // Bounds-checked cursor over the mapped file. Every multi-byte read
 // advances `pos` and checks it against `size` first; once a read runs
@@ -31,7 +43,7 @@ static u64 cur_u64(Cur* c) { u64 v = 0; cur_bytes(c, &v, 8); return v; }
 // on disk) into a freshly malloc'd null-terminated buffer.
 static char* cur_str(Cur* c) {
     u64 len = cur_u64(c);
-    if (!c->ok) return NULL;
+    if (!c->ok || len > GGUF_MAX_STR) { c->ok = 0; return NULL; }
     char* s = (char*)malloc(len + 1);
     if (!s) { c->ok = 0; return NULL; }
     cur_bytes(c, s, len);
@@ -102,8 +114,8 @@ int gguf_open(const char* path, GGUFFile* gf) {
     if (gf->fd < 0) return -1;
 
     struct stat st;
-    fstat(gf->fd, &st);
-    gf->size = st.st_size;
+    if (fstat(gf->fd, &st) != 0 || st.st_size < 0) { close(gf->fd); return -1; }
+    gf->size = (u64)st.st_size;
 
     gf->data = mmap(NULL, gf->size, PROT_READ, MAP_PRIVATE, gf->fd, 0);
     if (gf->data == MAP_FAILED) { close(gf->fd); return -1; }
@@ -114,6 +126,17 @@ int gguf_open(const char* path, GGUFFile* gf) {
     gf->hdr.n_tensors  = cur_u64(&c);
     gf->hdr.n_metadata = cur_u64(&c);
     if (!c.ok || gf->hdr.magic != GGUF_MAGIC) goto fail;
+    // v1 used u32 counts, not u64 -- reading it with this parser would
+    // misalign every field after the header. Only v2/v3 are supported.
+    if (gf->hdr.version < 2 || gf->hdr.version > 3) goto fail;
+    if (gf->hdr.n_metadata > GGUF_MAX_KV || gf->hdr.n_tensors > GGUF_MAX_TENSORS) goto fail;
+    {
+        // Self-scaling bound: N entries can't fit in fewer than N times each
+        // entry's minimum possible size (a key-len+type tag, or a
+        // name-len+n_dims+type+offset tuple) worth of remaining bytes.
+        u64 avail = gf->size - c.pos;
+        if (gf->hdr.n_metadata > avail / 12 || gf->hdr.n_tensors > avail / 24) goto fail;
+    }
 
     // Metadata KV table
     gf->n_kv = gf->hdr.n_metadata;
@@ -128,13 +151,18 @@ int gguf_open(const char* path, GGUFFile* gf) {
             m->arr_elem_type = cur_u32(&c);
             m->arr_len = cur_u64(&c);
             m->value_off = c.pos; // first element starts right after this sub-header
-            if (!c.ok) goto fail;
+            if (!c.ok || m->arr_len > GGUF_MAX_ARRAY) goto fail;
+            // Divide, never multiply: esz * arr_len can wrap a huge
+            // file-controlled arr_len into a small number, which would
+            // let cur_bytes "succeed" on a range that isn't really there.
+            u64 remain = c.pos > c.size ? 0 : c.size - c.pos;
             if (m->arr_elem_type == GGUF_TYPE_STRING) {
+                if (m->arr_len > remain / 8) goto fail; // each string costs >= its 8-byte length prefix
                 for (u64 j = 0; j < m->arr_len && c.ok; j++) cur_skip_str(&c);
             } else {
                 u64 esz = gguf_scalar_size(m->arr_elem_type);
-                if (esz == 0) { c.ok = 0; }
-                else cur_bytes(&c, NULL, esz * m->arr_len);
+                if (esz == 0 || m->arr_len > remain / esz) goto fail;
+                cur_bytes(&c, NULL, esz * m->arr_len);
             }
         } else {
             m->value_off = c.pos; // scalar/string value starts here
@@ -151,12 +179,21 @@ int gguf_open(const char* path, GGUFFile* gf) {
         GGUFTensorInfo* t = &gf->tensors[i];
         t->name = cur_str(&c);
         t->n_dims = cur_u32(&c);
-        if (!c.ok || t->n_dims > 4) goto fail;
-        for (u32 d = 0; d < t->n_dims; d++) t->dims[d] = cur_u64(&c);
+        if (!c.ok || t->n_dims == 0 || t->n_dims > 4) goto fail;
+        u64 count = 1;
+        for (u32 d = 0; d < t->n_dims; d++) {
+            t->dims[d] = cur_u64(&c);
+            // Nothing can be stored in under 1 bit per element, so a
+            // dimension (or the running product) bigger than 8x the whole
+            // file is definitely a corrupt/hostile value, not a real tensor.
+            if (!c.ok || t->dims[d] == 0 || t->dims[d] > gf->size * 8) goto fail;
+            count *= t->dims[d];
+            if (count > gf->size * 8) goto fail;
+        }
         for (u32 d = t->n_dims; d < 4; d++) t->dims[d] = 1;
         t->ggml_type = cur_u32(&c);
         t->offset = cur_u64(&c);
-        if (!c.ok) goto fail;
+        if (!c.ok || t->offset > gf->size) goto fail;
     }
 
     // Tensor data starts here, padded up to general.alignment (default 32).
@@ -231,6 +268,7 @@ char** gguf_get_string_array(GGUFFile* gf, const char* key, u64* count_out) {
     if (count_out) *count_out = 0;
     const GGUFMeta* m = find_kv(gf, key);
     if (!m || m->type != GGUF_TYPE_ARRAY || m->arr_elem_type != GGUF_TYPE_STRING) return NULL;
+    if (m->arr_len > GGUF_MAX_ARRAY) return NULL;
 
     char** arr = (char**)calloc(m->arr_len ? m->arr_len : 1, sizeof(char*));
     if (!arr) return NULL;
@@ -251,6 +289,7 @@ f32* gguf_get_f32_array(GGUFFile* gf, const char* key, u64* count_out) {
     if (count_out) *count_out = 0;
     const GGUFMeta* m = find_kv(gf, key);
     if (!m || m->type != GGUF_TYPE_ARRAY || m->arr_elem_type != GGUF_TYPE_FLOAT32) return NULL;
+    if (m->arr_len > GGUF_MAX_ARRAY) return NULL;
     f32* arr = (f32*)malloc((m->arr_len ? m->arr_len : 1) * sizeof(f32));
     if (!arr) return NULL;
     if (raw_read(gf, m->value_off, arr, m->arr_len * sizeof(f32)) != 0) { free(arr); return NULL; }
@@ -262,6 +301,7 @@ i32* gguf_get_i32_array(GGUFFile* gf, const char* key, u64* count_out) {
     if (count_out) *count_out = 0;
     const GGUFMeta* m = find_kv(gf, key);
     if (!m || m->type != GGUF_TYPE_ARRAY || m->arr_elem_type != GGUF_TYPE_INT32) return NULL;
+    if (m->arr_len > GGUF_MAX_ARRAY) return NULL;
     i32* arr = (i32*)malloc((m->arr_len ? m->arr_len : 1) * sizeof(i32));
     if (!arr) return NULL;
     if (raw_read(gf, m->value_off, arr, m->arr_len * sizeof(i32)) != 0) { free(arr); return NULL; }

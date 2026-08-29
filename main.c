@@ -17,6 +17,7 @@ void test_rope();
 void test_kv_cache();
 void test_int4_quant();
 void test_generate();
+void test_gguf_reject();
 
 // Run all unit tests to verify LLM building blocks
 void run_all_unit_tests() {
@@ -27,6 +28,7 @@ void run_all_unit_tests() {
     test_kv_cache();        // Test KV cache memory
     test_int4_quant();      // Test 4-bit quantization
     test_generate();        // Test tokenizer + full per-layer generate loop
+    test_gguf_reject();     // Test malformed GGUF files are rejected, not misread
     printf("=========================\n");
 }
 
@@ -219,4 +221,70 @@ void test_generate() {
 
     free(cache.key); free(cache.val);
     llama_model_free(&model);
+}
+
+static void write_test_gguf(const char* path, const u8* data, size_t len) {
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(data, 1, len, f); fclose(f); }
+}
+
+// A user-supplied .gguf is untrusted input -- these hostile files must make
+// gguf_open() fail cleanly (-1), not attempt a pathological allocation or
+// let an overflowed length survive into a later read.
+void test_gguf_reject() {
+    printf("\n[GGUF Reject Test]\n");
+    GGUFFile gf;
+
+    // 1. Bad magic.
+    {
+        u8 buf[24] = {0};
+        buf[0] = 'X'; buf[1] = 'X'; buf[2] = 'X'; buf[3] = 'X';
+        write_test_gguf("test_bad_magic.gguf", buf, sizeof(buf));
+        assert(gguf_open("test_bad_magic.gguf", &gf) == -1);
+        unlink("test_bad_magic.gguf");
+    }
+
+    // 2. Absurd tensor count (must exceed GGUF_MAX_TENSORS / the self-scaling bound).
+    {
+        u8 buf[24];
+        u32 magic = GGUF_MAGIC, version = 3;
+        u64 n_tensors = 0x0000FFFFFFFFFFFFULL, n_metadata = 0;
+        memcpy(buf, &magic, 4);
+        memcpy(buf + 4, &version, 4);
+        memcpy(buf + 8, &n_tensors, 8);
+        memcpy(buf + 16, &n_metadata, 8);
+        write_test_gguf("test_huge_tensors.gguf", buf, sizeof(buf));
+        assert(gguf_open("test_huge_tensors.gguf", &gf) == -1);
+        unlink("test_huge_tensors.gguf");
+    }
+
+    // 3. A metadata array whose length would overflow the old
+    //    "esz * arr_len" byte-count multiply (esz=4, arr_len=1<<62 wraps to
+    //    0, so the old code would have accepted this file and handed a
+    //    fabricated 2^62-entry array to a caller). This is the regression
+    //    case: it must fail against the new GGUF_MAX_ARRAY cap.
+    {
+        u8 buf[64];
+        u8* p = buf;
+        u32 magic = GGUF_MAGIC, version = 3;
+        u64 n_tensors = 0, n_metadata = 1;
+        memcpy(p, &magic, 4); p += 4;
+        memcpy(p, &version, 4); p += 4;
+        memcpy(p, &n_tensors, 8); p += 8;
+        memcpy(p, &n_metadata, 8); p += 8;
+        u64 keylen = 1;
+        memcpy(p, &keylen, 8); p += 8;
+        *p++ = 'x';
+        u32 type = GGUF_TYPE_ARRAY;
+        memcpy(p, &type, 4); p += 4;
+        u32 elem_type = GGUF_TYPE_FLOAT32;
+        memcpy(p, &elem_type, 4); p += 4;
+        u64 arr_len = 1ull << 62;
+        memcpy(p, &arr_len, 8); p += 8;
+        write_test_gguf("test_array_overflow.gguf", buf, (size_t)(p - buf));
+        assert(gguf_open("test_array_overflow.gguf", &gf) == -1);
+        unlink("test_array_overflow.gguf");
+    }
+
+    printf("all malformed files correctly rejected\n");
 }
