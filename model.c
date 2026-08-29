@@ -2,6 +2,44 @@
 #include "gguf.h"
 
 /**
+ * RoPE Rotary Positional Encoding
+ * In-place rotation of Q and K vector 2D coordinate pairs
+ * LLaMA standard base frequency = 10000
+ */
+void rope(f32* q, f32* k, u32 pos, u32 dim, u32 head_dim)
+{
+    // Traverse vector two elements at a time, each pair is a 2D coordinate point
+    for (u32 i = 0; i < dim; i += 2)
+    {
+        // Calculate relative index inside single attention head
+        f32 pair_idx = (f32)(i % head_dim);
+        // Compute rotation base angle theta
+        f32 theta = powf(10000.0f, -pair_idx / (f32)head_dim);
+        // Total rotation radian = position index * base angle
+        f32 rad = (f32)pos * theta;
+        // Precompute trigonometric values for rotation formula
+        f32 cos_t = cosf(rad);
+        f32 sin_t = sinf(rad);
+
+        // --------------------------
+        // Rotate Query vector pair
+        // --------------------------
+        f32 q0 = q[i];
+        f32 q1 = q[i + 1];
+        q[i]     = q0 * cos_t - q1 * sin_t;
+        q[i + 1] = q0 * sin_t + q1 * cos_t;
+
+        // --------------------------
+        // Rotate Key vector pair
+        // --------------------------
+        f32 k0 = k[i];
+        f32 k1 = k[i + 1];
+        k[i]     = k0 * cos_t - k1 * sin_t;
+        k[i + 1] = k0 * sin_t + k1 * cos_t;
+    }
+}
+
+/**
  * RMSNorm Vector Normalization
  * No mean subtraction; only root-mean-square scaling + learnable weight
  */

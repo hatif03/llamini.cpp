@@ -78,40 +78,25 @@ void test_gguf_loader(const char* model_path)
     printf("GGUF resource cleaned up\n");
 }
 
-/**
- * Unit test for RMSNorm normalization calculation
- */
 void test_rms_norm()
 {
     printf("\n[RMSNorm Unit Test]\n");
-    // Sample input vector
     f32 x[] = {1.0f, 2.0f, 3.0f, 4.0f};
-    // Uniform weight vector for simple testing
     f32 w[] = {1.0f, 1.0f, 1.0f, 1.0f};
     f32 out[4];
-
-    // Run RMSNorm calculation
     rms_norm(out, x, w, 4);
-
-    // Print normalized output values
     printf("Normalized vector: ");
     for (int i = 0; i < 4; i++)
         printf("%.4f ", out[i]);
     printf("\n");
 }
 
-/**
- * Unit test for SwiGLU feed-forward activation
- */
 void test_swiglu()
 {
     printf("\n[SwiGLU Unit Test]\n");
-    // Sample input vectors for gate and up
     f32 gate[] = {1.0f, -1.0f, 2.0f, -2.0f};
     f32 up[]   = {2.0f, 3.0f, 1.0f, 4.0f};
     f32 out[4];
-
-    // Run SwiGLU calculation
     swiglu(out, gate, up, 4);
     printf("SwiGLU output vector: ");
     for (int i = 0; i < 4; i++)
@@ -119,14 +104,38 @@ void test_swiglu()
     printf("\n");
 }
 
+/**
+ * Unit test for RoPE rotary positional encoding transformation
+ */
+void test_rope()
+{
+    printf("\n[RoPE Rotary Positional Encoding Test]\n");
+    // Short test vector, total dim = 8, single head dim = 8
+    f32 q[] = {1, 0, 1, 0, 1, 0, 1, 0};
+    f32 k[] = {1, 0, 1, 0, 1, 0, 1, 0};
+    u32 pos = 5;
+    u32 dim = 8;
+    u32 head_dim = 8;
+    
+    // Apply RoPE transformation to Q and K vectors
+    rope(q, k, pos, dim, head_dim);
+
+    printf("Rotated Q vector: ");
+    for(int i = 0; i < 8; i++) {
+        printf("%.3f ", q[i]);
+    }
+    printf("\n");
+}
+
 int main(int argc, char** argv)
 {
-    printf("===== Section 6: RMSNorm & SwiGLU FFN Full Test Suite =====\n");
+    printf("===== Section 7: RoPE Positional Encoding Full Test Suite =====\n");
     test_matmul();
     test_kv_cache();
     test_int4_quant();
     test_rms_norm();
     test_swiglu();
+    test_rope();
 
     if (argc >= 2)
     {
