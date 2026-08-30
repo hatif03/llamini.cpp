@@ -38,6 +38,15 @@ not raw arithmetic. Judges on a normal (non-virtualized, more RAM headroom)
 machine should expect meaningfully better and more consistent throughput than
 these numbers.
 
+After parallelizing linear() across output rows with pthreads (12 logical
+cores available in this VM): the same 48-token run measured 47.47s (1.01
+tok/s) -- roughly a 5-7x speedup over the pre-threading numbers above, and
+the generated text is byte-identical to the pre-threading run (parallelizing
+a deterministic reduction over disjoint output rows changes nothing about
+the result, only how it's computed). Note -pthread did not add a separate
+libpthread.so to the linked-library list below -- this glibc version (2.35+,
+Ubuntu with gcc 15.2) merges pthread symbols into libc.so.6 itself.
+
 2. Runtime verification against a real model file
 ----------------------------------------------------
 Downloaded the actual submission target,

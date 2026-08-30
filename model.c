@@ -1,4 +1,5 @@
 #include "model.h"
+#include <pthread.h> // model.c only -- keep the blast radius of adding threading small
 
 void rms_norm(f32* out, const f32* x, const f32* w, u32 dim, f32 eps) {
     f32 sum_sq = 0.0f;
@@ -27,13 +28,71 @@ void rope(f32* vec, u32 pos, u32 dim, u32 head_dim, f32 freq_base) {
     }
 }
 
-void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim) {
-    for (u32 o = 0; o < out_dim; o++) {
+#define MAX_THREADS    32
+#define LINEAR_PAR_MIN (1u << 20) // out_dim*in_dim below this: not worth spawning threads
+
+// Shared kernel for both the serial and threaded paths below -- exactly the
+// original single-loop body, just over a caller-chosen row range, so there
+// is only one place this dot product is written.
+static void linear_range(f32* out, const f32* x, const f32* w, u32 in_dim, u32 o0, u32 o1) {
+    for (u32 o = o0; o < o1; o++) {
         f32 sum = 0.0f;
         const f32* row = w + (u64)o * in_dim;
         for (u32 i = 0; i < in_dim; i++) sum += row[i] * x[i];
         out[o] = sum;
     }
+}
+
+typedef struct { f32* out; const f32* x; const f32* w; u32 in_dim, o0, o1; } LinearJob;
+
+static void* linear_worker(void* arg) {
+    LinearJob* j = (LinearJob*)arg;
+    linear_range(j->out, j->x, j->w, j->in_dim, j->o0, j->o1);
+    return NULL;
+}
+
+// ponytail: cached after the first call, read only from the single
+// (non-threaded) caller thread -- LLAMINI_THREADS overrides nproc, useful
+// under a cgroup CPU limit where sysconf overreports.
+static int n_threads(void) {
+    static int n = 0;
+    if (!n) {
+        const char* e = getenv("LLAMINI_THREADS");
+        n = e ? atoi(e) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n > MAX_THREADS) n = MAX_THREADS;
+    }
+    return n;
+}
+
+void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim) {
+    int nt = n_threads();
+    // Small matmuls (k_proj/v_proj) do less work than spawning threads
+    // would cost -- stay serial. Every linear() call site's out/x buffers
+    // are distinct (verified in generate.c); this dispatcher assumes that.
+    if (nt < 2 || (u64)out_dim * in_dim < LINEAR_PAR_MIN || out_dim < (u32)nt) {
+        linear_range(out, x, w, in_dim, 0, out_dim);
+        return;
+    }
+
+    pthread_t th[MAX_THREADS];
+    LinearJob jobs[MAX_THREADS];
+    u32 chunk = (out_dim + (u32)nt - 1) / (u32)nt;
+    int spawned = 0;
+    for (int t = 0; t < nt; t++) {
+        u32 o0 = (u32)t * chunk;
+        if (o0 >= out_dim) break;
+        u32 o1 = o0 + chunk > out_dim ? out_dim : o0 + chunk;
+        jobs[t] = (LinearJob){ out, x, w, in_dim, o0, o1 };
+        if (pthread_create(&th[spawned], NULL, linear_worker, &jobs[t]) != 0) {
+            // Couldn't spawn this or any later worker -- finish every
+            // remaining row serially so no output row is ever left unwritten.
+            linear_range(out, x, w, in_dim, o0, out_dim);
+            break;
+        }
+        spawned++;
+    }
+    for (int t = 0; t < spawned; t++) pthread_join(th[t], NULL);
 }
 
 void causal_mha(const f32* q, const f32* k, const f32* v, KVCache* cache,
@@ -47,6 +106,10 @@ void causal_mha(const f32* q, const f32* k, const f32* v, KVCache* cache,
 
     // ponytail: scores buffer sized to MAX_SEQ_LEN so this never allocates
     // per call; pos < cfg.seq_len <= MAX_SEQ_LEN is enforced at config load.
+    // NOT thread-safe: this is deliberately never called from more than one
+    // thread at once (unlike linear(), just above, which is). Per-token
+    // compute here is negligible next to linear()'s, so it isn't worth
+    // parallelizing -- if that ever changes, this must become per-thread.
     static f32 scores[MAX_SEQ_LEN];
 
     for (u32 h = 0; h < n_heads; h++) {
