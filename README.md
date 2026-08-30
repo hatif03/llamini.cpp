@@ -251,7 +251,11 @@ from somewhere else. Built unmodified upstream llama.cpp
 (`ggml-org/llama.cpp`, commit `0b5be7e`) from source on this same machine,
 in a scratch directory entirely outside this repo, never vendored or
 shipped (see STDLIB.md), and ran `llama-bench` against the exact same GGUF
-files this project already uses.
+files this project already uses. Full test-machine specs are in
+`deps-proof.txt` — in short, an ordinary 12-thread/16GB laptop, but with
+WSL2 capping the Linux guest that actually ran these numbers to ~7.6GB
+(WSL2's own default, uncorrected by a `.wslconfig`), which is the real
+cause of the noisy timing numbers below, not the code.
 
 | Model | llamini RSS | llama.cpp RSS | llamini tok/s\* | llama.cpp tok/s (tg32) |
 | --- | --- | --- | --- | --- |
