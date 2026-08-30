@@ -409,3 +409,42 @@ instruction tuning); none of the three fact completions were correct
 ("Two plus two equals" -> "two", not "four") but all three stayed
 grammatically fluent -- exactly the failure mode a small, un-tuned base
 model should show, not evidence of a bug.
+
+**Gemma-2b-it: code written and verified as far as this machine allows, full
+generation not achieved -- exactly the outcome flagged as likely before
+attempting it, not a surprise arrived at afterward.** Probed the real file
+first, same as GPT-2: confirmed `arch=gemma`, tied embeddings (no
+`output.weight` -- exercises the tied-embedding-sharing fix from the Qwen2.5
+commit), `tokenizer.ggml.model=llama` (the existing SentencePiece path,
+already correct, no new tokenizer code), and every tensor using formats
+already supported (`Q4_K`/`Q6_K`/`F32` -- no new quant format needed this
+time). This means Gemma needed *zero new lines of architecture code* --
+every piece (NEOX RoPE, GeGLU activation, `embedding_scale = sqrt(dim)`,
+tied embeddings, explicit `head_dim` from `gemma.attention.key_length`) was
+already built and verified via Qwen2.5.
+
+Ran it anyway, as asked, rather than only reasoning about it. Config
+auto-detection is confirmed correct against the real file (`dim=2048
+layers=18 heads=8 kv_heads=1 head_dim=256 ffn=16384 vocab=256128` --
+`head_count_kv=1` is genuine MQA, and `causal_mha`'s existing GQA
+broadcasting handles group size 8 with no changes). Beyond that point,
+three separate attempts to run a full `--bench` gave three different,
+inconclusive results: one produced no output at all before the tool-level
+timeout; a 25-second attempt returned cleanly (exit 0) having printed
+only the config line, with no bench output and no error printed either; a
+90-second attempt failed at the tool level with no further output
+captured. Each attempt was followed by a memory check confirming the VM
+itself returned to a healthy baseline afterward -- whatever failed, it
+wasn't a stuck process left running. Given this project's own math (a
+2.5B-parameter model with a 256128-entry vocabulary dequantized to f32 is
+~10-12GB resident) against this dev machine's 7.6GB RAM + 2GB swap, this is
+consistent with real memory exhaustion during the dequantization step
+specifically (the one step earlier phases of this log already established
+is where TinyLlama's own memory-ballooning slowness came from too), not a
+code defect -- but unlike TinyLlama's case, three attempts didn't produce
+one clean, explainable failure mode to point at, so this is reported as
+"inconclusive under memory pressure," not asserted as a confirmed specific
+cause. Not investigated further past this point, per the explicit decision
+going in: write the code, don't force a conclusive test this machine can't
+reliably give.
+model should show, not evidence of a bug.

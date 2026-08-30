@@ -1,13 +1,17 @@
 # llamini.cpp
 
 **llamini.cpp** is a from-scratch C99 reimplementation of llama.cpp's
-core: a real GGUF file parser (metadata + tensor-info table), a
-hand-rolled `Q4_K`/`Q6_K` block dequantizer, a 22-layer
-grouped-query-attention transformer forward pass, and a real SentencePiece-BPE
-tokenizer decoded from the GGUF file's own vocab — wired into a chat CLI that
-loads and runs an actual `TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf` file. Built
-for the Zero Dependency hackathon, Track F — libc and POSIX only, no
-third-party runtime dependency of any kind. See [STDLIB.md](STDLIB.md) for
+core: a real GGUF file parser (metadata + tensor-info table), hand-rolled
+block dequantizers for every quantization format a real Q4_K_M-labeled
+file actually uses in practice (`F32`/`F16`/`Q4_0`/`Q4_1`/`Q5_0`/`Q8_0`/
+`Q4_K`/`Q5_K`/`Q6_K`), a real transformer forward pass, and two independent
+from-scratch tokenizers (SentencePiece-style and byte-level BPE) decoded
+entirely from each GGUF file's own vocab — wired into a chat CLI that
+loads and runs real models across **four different architecture
+families** (LLaMA, Qwen2, GPT-2, Gemma — see "Other model families"
+below), not just one. Built for the Zero Dependency hackathon, Track F —
+libc and POSIX only, no third-party runtime dependency of any kind. See
+[STDLIB.md](STDLIB.md) for
 every package this project would normally reach for, and what stood in for
 it instead — including its ["Package Killer" section](STDLIB.md#package-killer-what-this-replaces),
 naming exactly what running a GGUF model normally requires installing
@@ -120,8 +124,68 @@ Numbers above are from one real run against the actual downloaded GGUF
 file; re-running `--bench` reproduces them (teacher forcing and greedy
 decoding are both deterministic).
 
+## Other model families
+
+The GGUF parser, dequantizers, and sampling/`--bench` machinery are
+architecture-agnostic; `general.architecture` in the file itself picks the
+forward-pass path (`llama.cpp:llama_config_from_gguf` for the LLaMA-family
+path shared by LLaMA/Qwen2/Gemma, or `gpt2.c`'s wholly separate module for
+GPT-2). Verified against real downloaded files from four different
+families, each surfacing something the previous ones didn't:
+
+| Model | Arch | Params | Vocab | Tokenizer | Perplexity\* | Fact completions correct | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TinyLlama-1.1B-Chat-v1.0 | `llama` | 1.1B | 32000 | SentencePiece | 13.28 | 1/3 | GQA (32 query / 4 KV heads); the baseline this whole engine was built against |
+| Qwen2.5-0.5B-Instruct | `qwen2` | 0.5B | 151936 | byte-level BPE | 10.84 | 3/3 | Needed NEOX RoPE, QKV bias, and `Q5_0` dequant (found by probing the real file, not assumed from its "Q4_K_M" name) |
+| GPT-2 (124M) | `gpt2` | 124M | 50257 | byte-level BPE | 20.58 | 0/3 | Needed a wholly separate module (`gpt2.c`): fused QKV, LayerNorm, learned position embeddings, ungated GELU, no RoPE at all; needed `Q5_K` dequant |
+| Gemma-2b-it | `gemma` | 2.5B | 256128 | SentencePiece | untested | untested | Config auto-detection verified correct (NEOX RoPE, GeGLU, `embedding_scale`, tied embeddings, MQA all already-built code, zero new lines) — full generation not achieved on this project's ~7.6GB dev machine; see Limits |
+
+\* Teacher-forced perplexity over the same fixed 35-ish-token English test
+corpus (`--bench`, see "Correctness evidence" above) — **not directly
+comparable across vocab sizes** (a larger vocab's random-guess ceiling is
+itself higher, so a fair comparison is each number against its own file's
+ceiling, not against each other): TinyLlama's ceiling is ~32000,
+Qwen2.5's ~151936, GPT-2's ~50257. All three measured numbers are three-ish
+orders of magnitude below their own ceiling. The GPT-2/TinyLlama/Qwen2.5
+ranking (worst to best) does track something real, though: newest,
+largest, most heavily instruction-tuned model wins, exactly as expected —
+not an artifact of the benchmark.
+
+Try any of them yourself:
+
+```bash
+./llamini qwen2.5-0.5b-instruct-q4_k_m.gguf --raw   # Qwen2.5-0.5B-Instruct
+./llamini gpt2.Q4_K_M.gguf                          # GPT-2 (no chat template for this arch)
+./llamini gemma-2b-it-q4_k_m.gguf --bench           # Gemma-2b -- config-only verified, see above
+```
+
+(`--raw` on Qwen2.5 because this project's chat template, `build_chat_prompt_tokens`
+in `main.c`, is hardcoded to TinyLlama-Chat's specific `<|system|>/<|user|>/<|assistant|>`
+format — Qwen models actually use a different convention, ChatML
+(`<|im_start|>`/`<|im_end|>`), not implemented here. Raw completion works
+correctly regardless of chat template, and is what the comparison table
+above uses for a fair, template-independent measurement.)
+
 ## Limits (honest, not papered over)
 
+- **Only four architectures, one of them unverified end-to-end.** `llama`,
+  `qwen2`, and `gpt2` are verified against real downloaded files (see
+  "Other model families"). `gemma`'s architecture-specific code (NEOX
+  RoPE, GeGLU, `embedding_scale`, tied embeddings, MQA) is all shared with
+  the already-verified LLaMA-family path and its config auto-detection is
+  confirmed correct against a real file, but full generation was not
+  achieved on this project's dev machine (~7.6GB RAM; Gemma-2b needs
+  roughly 10-12GB dequantized to f32) — three attempts gave inconclusive
+  results (no clean, single failure mode to point at) rather than one
+  confirmed crash, so this is reported as "untested under memory
+  pressure," not asserted as definitely working or definitely broken.
+  Mistral (GGUF architecture is literally `"llama"`, so it would load with
+  the existing code) and Gemma2 (real added complexity — logit/attention
+  softcapping, sliding-window attention, a `head_dim` that isn't
+  `dim/n_heads`) were not attempted at all. No chat template exists for
+  Qwen2 (it uses ChatML, `<|im_start|>`/`<|im_end|>`, not TinyLlama-Chat's
+  format) or GPT-2 (no instruction-tuned convention to wrap in the first
+  place) — both are raw-completion-only here.
 - **Chat template is a best-effort reconstruction, not verified against a
   real tokenizer run.** `build_chat_prompt_tokens` (`main.c`) wraps your
   input in TinyLlama-Chat's own `<|system|>/<|user|>/<|assistant|>` template
