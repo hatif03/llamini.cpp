@@ -5,7 +5,7 @@ description: Maps llamini.cpp modules, stubs vs target inference, and how to ext
 
 # llamini.cpp architecture
 
-C99 mini llama.cpp. Extend existing files. Do not add a `src/` tree or a third-party tokenizer.
+A minimal, from-scratch C99 llama.cpp core. Extend existing files. Do not add a `src/` tree or a third-party tokenizer.
 
 ## Module map
 
@@ -21,7 +21,7 @@ C99 mini llama.cpp. Extend existing files. Do not add a `src/` tree or a third-p
 | `generate.c` / `generate.h` | full per-layer autoregressive loop, teacher-forced perplexity | real: `forward_step` (embed -> 22x layer stack -> final norm -> lm_head) is shared by `generate_autoregressive` (prefills the whole prompt through the KV cache before sampling/appending anything — critical fix, see git history) and `compute_perplexity` (teacher-forced, used by `--bench`); `sample_token` supports temperature + top-p nucleus sampling, `temp<=0` dispatches to the original deterministic `greedy_sample`; in `SRC` |
 | `main.c` | CLI, `--test`, `--bench`, chat | opens the GGUF file first, derives config from it, then inits/loads the model, loads the vocab, allocates per-layer KV caches, and either chats (`start_chat`, with `build_chat_prompt_tokens` wrapping input in TinyLlama-Chat's own template unless `--raw`) or runs the correctness benchmark (`run_bench`, `--bench`) |
 
-Makefile `SRC`: `main.c tensor.c model.c gguf.c kv_cache.c quant.c tokenizer.c generate.c` → `mini_llama`. `CFLAGS` includes `-pthread` (used by `model.c`'s `linear()`) and conservative fast-math flags (see Makefile comment).
+Makefile `SRC`: `main.c tensor.c model.c gguf.c kv_cache.c quant.c tokenizer.c generate.c` → `llamini`. `CFLAGS` includes `-pthread` (used by `model.c`'s `linear()`) and conservative fast-math flags (see Makefile comment).
 
 Config is no longer hardcoded — `llama_config_from_gguf` reads it from the file, falling back to TinyLlama-1.1B-shaped defaults (dim 2048, 22 layers, 32 heads, vocab 32000) only for keys a file doesn't define.
 

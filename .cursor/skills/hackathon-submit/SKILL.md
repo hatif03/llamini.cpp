@@ -13,11 +13,11 @@ Do not invent `package.json`, `Cargo.toml`, `vcpkg.json`, or `conanfile`. C’s 
 | --- | --- |
 | `README.md` | what it does, how to run, honest limits |
 | `STDLIB.md` | every “I'd normally import X, instead I used stdlib Y” |
-| `Makefile` | one command → runnable `mini_llama` |
+| `Makefile` | one command → runnable `llamini` |
 | `deps-proof.txt` | output showing only libc/libm (and no package manifests) |
 | `.zero-dep.toml` | track letter + one-line pitch |
 
-Pin the toolchain in the README: `gcc`, C99 (`-std=c99`), POSIX, `-lm`. Example run: `make` then `./mini_llama model.gguf` (or `--test`).
+Pin the toolchain in the README: `gcc`, C99 (`-std=c99`), POSIX, `-lm`. Example run: `make` then `./llamini model.gguf` (or `--test`).
 
 This repo currently has `README.MD`. Prefer `README.md` for judges; do not leave two conflicting READMEs.
 
@@ -25,7 +25,7 @@ This repo currently has `README.MD`. Prefer `README.md` for judges; do not leave
 
 ```toml
 track = "F"
-pitch = "A C99 mini llama.cpp: GGUF mmap and transformer ops with libc and POSIX only."
+pitch = "llamini.cpp: a C99 llama.cpp core (GGUF mmap and transformer ops) with libc and POSIX only."
 ```
 
 ## STDLIB.md rows this repo can honestly claim
@@ -46,9 +46,9 @@ Do not claim Q4_K_M, a full GGUF table parse, or a real forward pass until the c
 
 Capture commands and output, for example:
 
-- Linux: `ldd mini_llama` — only libc, libm, libpthread, ld-linux
-- macOS: `otool -L mini_llama`
-- Windows (MinGW): `ldd mini_llama.exe` or dumpbin `/dependents`
+- Linux: `ldd llamini` — only libc, libm, libpthread, ld-linux
+- macOS: `otool -L llamini`
+- Windows (MinGW): `ldd llamini.exe` or dumpbin `/dependents`
 
 Also record: no `vcpkg.json`, no `conanfile`, no `CMakeLists.txt` with FetchContent.
 

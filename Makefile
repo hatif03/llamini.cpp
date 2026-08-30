@@ -15,7 +15,7 @@ SRC = main.c tensor.c model.c gguf.c kv_cache.c quant.c tokenizer.c generate.c
 OBJ = $(SRC:.c=.o)
 
 # Output program name
-TARGET = mini_llama
+TARGET = llamini
 
 # Build the final program
 all: $(TARGET)

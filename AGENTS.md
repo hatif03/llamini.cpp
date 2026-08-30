@@ -1,6 +1,6 @@
 # llamini.cpp
 
-C99 mini llama.cpp for the Zero Dependency hackathon (Track F). libc, POSIX, and the C standard library only.
+llamini.cpp: a minimal, from-scratch C99 reimplementation of llama.cpp's core, for the Zero Dependency hackathon (Track F). libc, POSIX, and the C standard library only.
 
 ## Hard rule
 

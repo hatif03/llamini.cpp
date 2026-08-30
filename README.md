@@ -1,7 +1,8 @@
 # llamini.cpp
 
-A C99 mini `llama.cpp`: a real GGUF file parser (metadata + tensor-info
-table), a hand-rolled `Q4_K`/`Q6_K` block dequantizer, a 22-layer
+**llamini.cpp** is a from-scratch C99 reimplementation of llama.cpp's
+core: a real GGUF file parser (metadata + tensor-info table), a
+hand-rolled `Q4_K`/`Q6_K` block dequantizer, a 22-layer
 grouped-query-attention transformer forward pass, and a real SentencePiece-BPE
 tokenizer decoded from the GGUF file's own vocab — wired into a chat CLI that
 loads and runs an actual `TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf` file. Built
@@ -23,33 +24,33 @@ code uses `mmap`/`open`/`fstat`, which plain MinGW does not provide (see
 ```bash
 make clean
 make
-./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
 Chat is greedy (deterministic) by default. Pass `--temp X` (0 < X, e.g. 0.8)
 for temperature + top-p=0.9 nucleus sampling instead:
 
 ```bash
-./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --temp 0.8
+./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --temp 0.8
 ```
 
 Run the in-process unit tests instead of the chat loop:
 
 ```bash
-./mini_llama --test
+./llamini --test
 ```
 
 Run the quantitative correctness benchmark (see "Correctness evidence"
 below) instead of the chat loop:
 
 ```bash
-./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --bench
+./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --bench
 ```
 
 ## Chat loop
 
 ~~~text
-$ ./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+$ ./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 Loaded GGUF v3 (201 tensors, 23 metadata entries)
 Config: dim=2048 layers=22 heads=32 kv_heads=4 ffn=5632 vocab=32000 seq_len=2048
 
@@ -93,7 +94,7 @@ this file's template guess (see Limits) ever needs bypassing.
 "The output looks like English" is a weak correctness claim. This project
 doesn't have (and, staying zero-dependency, deliberately didn't build) a
 reference `llama.cpp`/`transformers` install to diff against bit-for-bit, so
-`./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --bench` instead runs two
+`./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --bench` instead runs two
 self-contained, honest checks against the real model:
 
 1. **Teacher-forced perplexity** over a short fixed English test corpus

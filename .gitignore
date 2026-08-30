@@ -2,8 +2,8 @@
 *.o
 *.obj
 *.exe
-mini_llama
-mini_llama.exe
+llamini
+llamini.exe
 a.out
 *.pdb
 *.ilk
