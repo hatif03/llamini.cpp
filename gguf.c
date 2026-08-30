@@ -1,3 +1,9 @@
+// posix_fadvise/posix_madvise are POSIX.1-2001/2008, but glibc hides them
+// under -std=c99 unless a feature-test macro is set before any system
+// header is pulled in -- must come before gguf.h's include of common.h.
+// gguf.c only, same reasoning as model.c's pthread.h comment: keep the
+// blast radius of this one small.
+#define _POSIX_C_SOURCE 200809L
 #include "gguf.h"
 
 // Sane upper bounds on counts read straight from a user-supplied (untrusted)
@@ -120,6 +126,11 @@ int gguf_open(const char* path, GGUFFile* gf) {
     gf->data = mmap(NULL, gf->size, PROT_READ, MAP_PRIVATE, gf->fd, 0);
     if (gf->data == MAP_FAILED) { close(gf->fd); return -1; }
 
+    // The metadata/tensor-info parse below scans the file front-to-back;
+    // tell the kernel so readahead is aggressive during it. Ignored return
+    // value is fine -- these are hints, not correctness-affecting.
+    posix_fadvise(gf->fd, 0, (off_t)gf->size, POSIX_FADV_SEQUENTIAL);
+
     Cur c; cur_init(&c, (const u8*)gf->data, gf->size, 0);
     gf->hdr.magic   = cur_u32(&c);
     gf->hdr.version = cur_u32(&c);
@@ -203,6 +214,11 @@ int gguf_open(const char* path, GGUFFile* gf) {
         u64 unaligned = c.pos;
         gf->tensor_offset = (unaligned + align - 1) / align * align;
     }
+
+    // Parsing is done; inference-time access to gf->data is scattered
+    // per-block reads driven by matmul row order, not a sequential scan --
+    // switch the hint so the kernel stops over-reading ahead.
+    posix_madvise(gf->data, gf->size, POSIX_MADV_RANDOM);
     return 0;
 
 fail:

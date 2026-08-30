@@ -519,3 +519,24 @@ memory pressure, not a bug introduced by this change. Confirmed:
 - `./llamini --test` unchanged (all existing assertions pass).
 
 Commit: `model: replace spawn-per-call threading with a persistent thread pool`
+
+**Step 2: posix_fadvise/madvise hints.** Trivial, POSIX-legal (`<fcntl.h>`/
+`<sys/mman.h>`, both already included via `common.h`), mirroring what the
+research above found in llama.cpp's `llama-mmap.cpp`: `POSIX_FADV_SEQUENTIAL`
+around the metadata/tensor-info parse (a genuine front-to-back scan),
+`POSIX_MADV_RANDOM` right after, before `gguf_open` returns (inference-time
+tensor access is scattered per-block reads driven by matmul row order, not
+sequential). Hit one build error first: `posix_fadvise`/`posix_madvise` are
+POSIX.1-2001/2008 but glibc hides them under `-std=c99` unless a feature-test
+macro is set *before* the first system header is pulled in — added
+`#define _POSIX_C_SOURCE 200809L` at the very top of `gguf.c`, before its
+`#include "gguf.h"` (which pulls in `common.h`'s system headers), matching
+the file-scoped-blast-radius pattern `model.c` already uses for `pthread.h`.
+Verified: `--test` unchanged, a real TinyLlama load still prints the
+identical `Loaded GGUF v3 (201 tensors, 23 metadata entries)` / `Config:`
+lines. No measurable timing claim made for this step — these are hints, not
+a guaranteed win, and this dev VM's page cache is already warm across runs
+either way; it's included because it's correct, free, and the same "no
+private copy of what could stay page-cache-backed" spirit as step 3.
+
+Commit: `gguf: add posix_fadvise/madvise hints for sequential-load then random-access reads`
