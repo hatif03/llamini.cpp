@@ -6,6 +6,7 @@
 #include "quant.h"
 #include "tokenizer.h"
 #include "generate.h"
+#include "gpt2.h"
 
 #define MAX_TURN_TOKENS 128
 #define MAX_GEN_TOKENS  48
@@ -184,6 +185,67 @@ void run_bench(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
     }
 }
 
+// GPT-2 has no chat-tuned variant here and no chat template of its own --
+// this is plain raw completion, matching --raw's behavior on the LLaMA
+// path (there's no non-raw mode to compare against for this architecture).
+void gpt2_chat(GPT2Model* model, KVCache* caches, Vocab* vocab, f32 temp) {
+    char user_input[MAX_PROMPT_LEN];
+    char word[MAX_TOKEN_LEN];
+    u32 input_tokens[MAX_TURN_TOKENS];
+    u32 out_tokens[MAX_TURN_TOKENS + MAX_GEN_TOKENS];
+
+    printf("\n======== GPT-2 GGUF Completion Engine Ready ========\n");
+    printf("Real GGUF weights + byte-level BPE tokenizer, raw completion (no chat template for this arch).\n\n");
+
+    while (1) {
+        printf("You: ");
+        if (!fgets(user_input, MAX_PROMPT_LEN, stdin)) break;
+        size_t len = strlen(user_input);
+        if (len > 0 && user_input[len - 1] == '\n') user_input[len - 1] = '\0';
+        if (!strcmp(user_input, "exit") || !strcmp(user_input, "quit")) { printf("Bot: Bye!\n"); break; }
+
+        u32 in_count = text_to_tokens(vocab, user_input, input_tokens, MAX_TURN_TOKENS);
+        for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
+        u32 total = gpt2_generate(model, caches, input_tokens, in_count, out_tokens, MAX_GEN_TOKENS,
+                                    vocab->eos_id, temp, 0.9f);
+
+        printf("Bot:");
+        for (u32 i = in_count; i < total; i++)
+            if (token_to_text(vocab, out_tokens[i], word, sizeof(word)) > 0) printf("%s", word);
+        printf("\n\n");
+    }
+}
+
+void gpt2_bench(GPT2Model* model, KVCache* caches, Vocab* vocab) {
+    printf("\n======== Correctness Benchmark ========\n");
+    printf("Test corpus: \"%s\"\n\n", BENCH_CORPUS);
+
+    u32 tokens[256];
+    u32 n = text_to_tokens(vocab, BENCH_CORPUS, tokens, 256);
+
+    f32 ppl = gpt2_compute_perplexity(model, caches, tokens, n);
+    f32 ceiling = (f32)model->cfg.vocab_size;
+    printf("Teacher-forced perplexity over %u tokens: %.2f\n", n, ppl);
+    printf("Random-baseline ceiling (uniform over a %u-token vocab): ~%.0f (%.2f nats/token)\n",
+           model->cfg.vocab_size, ceiling, logf(ceiling));
+    printf("A broken/randomly-wired forward pass would land near that ceiling;\n"
+           "a working language model should land dramatically lower.\n");
+
+    printf("\n-- known-fact completions (greedy, raw prompt, informational not asserted) --\n");
+    for (u32 p = 0; p < BENCH_N_PROMPTS; p++) {
+        u32 in_tok[MAX_TURN_TOKENS];
+        u32 in_n = text_to_tokens(vocab, BENCH_PROMPTS[p], in_tok, MAX_TURN_TOKENS);
+        u32 out_tok[MAX_TURN_TOKENS + 8];
+        for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
+        u32 total = gpt2_generate(model, caches, in_tok, in_n, out_tok, 8, vocab->eos_id, 0.0f, 0.0f);
+        printf("\"%s\" ->", BENCH_PROMPTS[p]);
+        char word[MAX_TOKEN_LEN];
+        for (u32 i = in_n; i < total; i++)
+            if (token_to_text(vocab, out_tok[i], word, sizeof(word)) > 0) printf("%s", word);
+        printf("\n");
+    }
+}
+
 // ==============================================
 // Main function: parse a real GGUF file end to end (metadata-driven
 // config, real weights, real vocab) and start chatting.
@@ -217,6 +279,46 @@ int main(int argc, char** argv) {
     printf("Loaded GGUF v%u (%llu tensors, %llu metadata entries)\n",
            gf.hdr.version, (unsigned long long)gf.hdr.n_tensors, (unsigned long long)gf.hdr.n_metadata);
 
+    Vocab vocab;
+    int have_vocab = (vocab_load_from_gguf(&gf, &vocab) == 0);
+    if (!have_vocab)
+        fprintf(stderr, "warning: no tokenizer vocab in this GGUF file; chat disabled\n");
+
+    // GPT-2 is architecturally separate enough (fused QKV, LayerNorm,
+    // learned position embeddings, ungated GELU, no RoPE) to be a wholly
+    // different model type (gpt2.c), not another LLaMAConfig flag --
+    // peek the architecture string before deciding which path to take.
+    char* peek_arch = gguf_get_str(&gf, "general.architecture");
+    int is_gpt2 = peek_arch && !strcmp(peek_arch, "gpt2");
+    free(peek_arch);
+
+    if (is_gpt2) {
+        GPT2Config cfg = gpt2_config_from_gguf(&gf);
+        printf("Config: arch=gpt2 dim=%u layers=%u heads=%u ffn=%u vocab=%u n_ctx=%u\n",
+               cfg.dim, cfg.n_layers, cfg.n_heads, cfg.ffn_dim, cfg.vocab_size, cfg.n_ctx);
+
+        GPT2Model model;
+        if (gpt2_model_init(&model, &cfg) != 0) { gguf_close(&gf); return -1; }
+        if (gpt2_load_weights(&model, &gf) != 0)
+            fprintf(stderr, "warning: could not load model weights from this GGUF file "
+                            "(missing tensor, or a quantization type this reader doesn't "
+                            "support -- see README limits); running with zero-initialized "
+                            "weights\n");
+
+        KVCache* caches = (KVCache*)calloc(cfg.n_layers, sizeof(KVCache));
+        for (u32 l = 0; l < cfg.n_layers; l++) kv_cache_init(&caches[l], cfg.dim, cfg.n_ctx);
+
+        if (have_vocab && bench_mode) gpt2_bench(&model, caches, &vocab);
+        else if (have_vocab) gpt2_chat(&model, caches, &vocab, temp);
+
+        for (u32 l = 0; l < cfg.n_layers; l++) { free(caches[l].key); free(caches[l].val); }
+        free(caches);
+        if (have_vocab) vocab_free(&vocab);
+        gguf_close(&gf);
+        gpt2_model_free(&model);
+        return 0;
+    }
+
     // TinyLlama-1.1B-shaped defaults, used only for keys the file doesn't
     // define; every value the file does define overrides these. Designated
     // initializers (not positional) so adding a field to LLaMAConfig can't
@@ -241,11 +343,6 @@ int main(int argc, char** argv) {
                         "support -- see README limits); running with zero-initialized "
                         "weights\n");
     }
-
-    Vocab vocab;
-    int have_vocab = (vocab_load_from_gguf(&gf, &vocab) == 0);
-    if (!have_vocab)
-        fprintf(stderr, "warning: no tokenizer vocab in this GGUF file; chat disabled\n");
 
     u32 kv_dim = cfg.n_heads_kv * cfg.head_dim;
     KVCache* caches = (KVCache*)calloc(cfg.n_layers, sizeof(KVCache));

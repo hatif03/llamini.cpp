@@ -9,7 +9,7 @@ CC = gcc
 CFLAGS = -Wall -O3 -march=native -fassociative-math -fno-signed-zeros -fno-trapping-math -pthread -std=c99 -lm
 
 # All source files
-SRC = main.c tensor.c model.c gguf.c kv_cache.c quant.c tokenizer.c generate.c
+SRC = main.c tensor.c model.c gguf.c kv_cache.c quant.c tokenizer.c generate.c gpt2.c
 
 # Convert .c to .o
 OBJ = $(SRC:.c=.o)

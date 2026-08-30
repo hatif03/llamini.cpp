@@ -371,3 +371,41 @@ BPE encode -> merge -> decode is a much sharper test than ASCII-only text
 would be. `--bench`: perplexity **10.84** over 35 tokens (ceiling ~151936
 for this file's larger vocab); all three fact completions correct,
 including "Two plus two equals" -> "four" (TinyLlama got this one wrong).
+
+**GPT-2-124M**: this one genuinely needed a new module, not a config flag
+on the existing path — fused QKV (one tensor, sliced into Q/K/V after a
+single `linear()` call rather than three separate projections), learned
+absolute position embeddings added directly to the token embedding (no
+RoPE at all), LayerNorm (mean-centered, with a bias — RMSNorm has neither),
+plain multi-head attention (turned out to need zero new attention code:
+`causal_mha` with `n_heads_kv == n_heads` *is* plain MHA, no GQA broadcasting
+active), and an ungated GELU MLP (no gate tensor at all, unlike SwiGLU/
+GeGLU's shared gated shape). Wrote `gpt2.c`/`gpt2.h` as a fully separate
+module rather than bolting more special cases onto `model.c` — the two
+architectures share almost nothing.
+
+Learned from the Qwen2 experience: **probed the real file's tensor names
+and types before writing any loading code this time**, rather than
+assuming from the research summary. Good thing — found `attn_qkv.weight`
+uses `Q5_K` (ggml type 13), a format declared in `gguf.h` back when Q4_K_M
+support was first built but never actually implemented (no real file had
+exercised it yet). Implemented `Q5_K` dequantization (the same 256-element
+super-block structure as `Q4_K`, plus a packed high-bit plane for a 5-bit
+value) *before* attempting a real run, using the probe's confirmed tensor
+names (`token_embd.weight`, `position_embd.weight`, `output_norm.{weight,bias}`,
+per-layer `attn_qkv.{weight,bias}`, `attn_output.{weight,bias}`,
+`ffn_norm.{weight,bias}`, `ffn_up.{weight,bias}`, `ffn_down.{weight,bias}`,
+separate `output.weight` -- not tied). Paid off: **the very first real run
+worked, no further bugs** -- unlike Qwen2.5, where the first run failed on
+a missing quant format. Config auto-detected correctly (`dim=768 layers=12
+heads=12 vocab=50257 n_ctx=1024`), and `hello` continues as a fluent,
+grammatically correct news-style sentence about an arrest -- a distinctly
+different register from either TinyLlama's or Qwen2.5's completions,
+consistent with GPT-2's actual training data and era. `--bench`: perplexity
+**20.58** over 35 tokens (still three orders of magnitude below the ~50257
+ceiling, but honestly higher than TinyLlama's 13.28 or Qwen2.5's 10.84 --
+expected, since this is the smallest, oldest model of the three with no
+instruction tuning); none of the three fact completions were correct
+("Two plus two equals" -> "two", not "four") but all three stayed
+grammatically fluent -- exactly the failure mode a small, un-tuned base
+model should show, not evidence of a bug.
