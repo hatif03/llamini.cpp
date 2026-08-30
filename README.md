@@ -158,7 +158,14 @@ decoding are both deterministic).
   1.0-2.1 tok/s after, on that same VM's 12 logical cores. Since prefilling
   the prompt runs the full forward pass once per prompt token before the
   first reply token, a long prompt now costs proportionally more time up
-  front than the old (incorrect) O(1)-in-prompt-length behavior did.
+  front than the old (incorrect) O(1)-in-prompt-length behavior did. The
+  architecturally "correct" fix for the memory footprint — keep weights
+  quantized and dequantize per-block on the fly inside `linear()`, instead
+  of fully dequantizing to `f32` at load time — was deliberately not
+  attempted: it's rated high risk (could silently produce plausible-but-
+  wrong output rather than an obvious failure) for a benefit not yet
+  confirmed to be worth it here. See the `llamini-architecture` skill's
+  "Still open" section for the concrete plan if this is picked up later.
 - **Dequantization supports F32, F16, Q4_0, Q4_1, Q8_0, Q4_K, Q6_K** (the
   types an actual Q4_K_M file uses for norms/weights/output). Anything
   else (`Q2_K`, `Q3_K`, `Q5_K`, `Q8_K`, ...) makes `gguf_dequantize_tensor`
