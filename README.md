@@ -74,11 +74,41 @@ multi-gigabyte download required to confirm the build produced a working
 binary. A `.gguf` model path is **runtime input you supply**, the same way
 `cat somefile.txt` needs `somefile.txt` to exist — it's not a build
 dependency, and this project doesn't ship one (a real model is 100MB-2GB+;
-bundling one would be a strange thing for a Makefile to require). Once you
-do have one (download links below), everything else in this README follows:
+bundling one would be a strange thing for a Makefile to require).
+
+**Getting an actual model is guided, not a scavenger hunt:**
+
+```bash
+./llamini --list-models      # 4 small models verified to work, with sizes
+./llamini --setup tinyllama  # prints the exact curl command, or launches
+                              # straight into it if the file's already there
+```
+
+Why the tool prints a `curl` command instead of just fetching the file
+itself: HuggingFace only serves over HTTPS, and implementing TLS from
+scratch is out of scope for a weekend — the only two ways around that
+(linking a crypto library, or shelling out to `curl`/`wget`) are both things
+this hackathon's rules forbid (a vendored dependency, or a "hidden dep" on a
+separately-installed tool). So the network request happens in the open, in
+a command you can read before running, not hidden inside the binary.
+
+Once you have a file — via `--setup` above, or any other GGUF file you
+already have — everything else in this README follows:
 
 ```bash
 ./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+```
+
+Every chat/bench session ends with a self-reported summary — tokens
+generated, average tok/s, and peak resident memory via `getrusage()` (a
+real POSIX call; no external profiler like `/usr/bin/time -v` needed to see
+this number, which is exactly the metric the "CPU optimization" section
+below is about):
+
+```text
+---- session summary ----
+arch=gpt2  tokens=59  wall=2.4s  avg=24.16 tok/s
+peak resident memory: 811 MB (self-reported via getrusage, no external tool)
 ```
 
 Chat is greedy (deterministic) by default. Pass `--temp X` (0 < X, e.g. 0.8)

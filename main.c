@@ -7,9 +7,89 @@
 #include "tokenizer.h"
 #include "generate.h"
 #include "gpt2.h"
+#include <sys/resource.h> // getrusage -- POSIX, main.c only, for the self-reported
+                          // peak-memory summary (see print_session_summary below)
 
 #define MAX_TURN_TOKENS 128
 #define MAX_GEN_TOKENS  48
+
+// A curated list of small models verified to work end-to-end with this
+// engine (see README's "Other model families"), so a first-time user
+// doesn't have to already know a working GGUF file/URL to try this out.
+// URLs point at each model's real Hugging Face repo -- verified to resolve
+// (redirect to the actual CDN-hosted file) before being hardcoded here,
+// not guessed; this project doesn't ship an unverified claim, including a
+// URL. Downloading it yourself is unavoidable without a TLS dependency
+// (HTTPS-only, and this project has no crypto library) or shelling out to
+// curl/wget (forbidden as a "hidden dep") -- see --setup below and
+// STDLIB.md for the full reasoning.
+typedef struct {
+    const char* short_name;   // argument to --setup
+    const char* display_name;
+    const char* arch;
+    const char* params;
+    const char* approx_size;
+    const char* filename;     // expected local path (current directory)
+    const char* url;
+} KnownModel;
+
+static const KnownModel KNOWN_MODELS[] = {
+    { "tinyllama", "TinyLlama-1.1B-Chat-v1.0", "llama", "1.1B", "~669MB",
+      "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+      "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" },
+    { "qwen2.5", "Qwen2.5-0.5B-Instruct", "qwen2", "0.5B", "~491MB",
+      "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf" },
+    { "gpt2", "GPT-2 (124M)", "gpt2", "124M", "~111MB",
+      "gpt2.Q4_K_M.gguf",
+      "https://huggingface.co/RichardErkhov/openai-community_-_gpt2-gguf/resolve/main/gpt2.Q4_K_M.gguf" },
+    { "gemma", "Gemma-2b-it", "gemma", "2.5B", "~1.5GB",
+      "gemma-2b-it-q4_k_m.gguf",
+      "https://huggingface.co/lmstudio-ai/gemma-2b-it-GGUF/resolve/main/gemma-2b-it-q4_k_m.gguf" },
+};
+#define N_KNOWN_MODELS (sizeof(KNOWN_MODELS) / sizeof(KNOWN_MODELS[0]))
+
+static void print_model_list(void) {
+    printf("Known small models, verified end-to-end with this engine:\n\n");
+    printf("  %-10s %-26s %-6s %-6s %s\n", "NAME", "MODEL", "ARCH", "PARAMS", "SIZE");
+    for (size_t i = 0; i < N_KNOWN_MODELS; i++) {
+        const KnownModel* m = &KNOWN_MODELS[i];
+        printf("  %-10s %-26s %-6s %-6s %s\n", m->short_name, m->display_name, m->arch, m->params, m->approx_size);
+    }
+    printf("\nRun `./llamini --setup <name>` for the exact download command, and to\n"
+           "launch straight into it once the file is present in this directory.\n");
+}
+
+static const KnownModel* find_known_model(const char* name) {
+    for (size_t i = 0; i < N_KNOWN_MODELS; i++)
+        if (!strcmp(KNOWN_MODELS[i].short_name, name)) return &KNOWN_MODELS[i];
+    return NULL;
+}
+
+static int file_ready(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+// Printed once at the end of every chat/bench session -- tokens actually
+// generated, average throughput, and peak resident memory via getrusage()
+// (POSIX, real numbers this process actually used -- no external profiler
+// like `/usr/bin/time -v` needed to see this; see README's "CPU optimization"
+// for why the memory number in particular is worth watching).
+static void print_session_summary(const char* arch, u32 tokens, double elapsed_s) {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    // ru_maxrss is kilobytes on Linux (this project's verified platform --
+    // see README/deps-proof.txt); macOS reports bytes instead, which would
+    // read 1024x too small here -- not corrected for, since this hasn't
+    // been tested on macOS and guessing at an untested code path would be
+    // worse than an honestly Linux-only number.
+    printf("\n---- session summary ----\n");
+    printf("arch=%s  tokens=%u  wall=%.1fs", arch ? arch : "?", tokens, elapsed_s);
+    if (tokens > 0 && elapsed_s > 0.01) printf("  avg=%.2f tok/s", (double)tokens / elapsed_s);
+    printf("\npeak resident memory: %ld MB (self-reported via getrusage, no external tool)\n",
+           (long)(ru.ru_maxrss / 1024));
+}
 
 // Test functions (for teaching core LLM components)
 void test_tensor_matmul();
@@ -88,11 +168,12 @@ static u32 build_chat_prompt_tokens(const Vocab* vocab, const char* user_input,
 // above), tokenizing your line directly -- useful as an A/B control, and as
 // a fallback if this file's template guess ever needs to be bypassed.
 // ==============================================
-void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp, int raw_mode) {
+u32 start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp, int raw_mode) {
     char user_input[MAX_PROMPT_LEN];
     char word[MAX_TOKEN_LEN];
     u32 input_tokens[MAX_TURN_TOKENS];
     u32 out_tokens[MAX_TURN_TOKENS + MAX_GEN_TOKENS];
+    u32 session_tokens = 0;
 
     printf("\n======== TinyLlama GGUF Chat Engine Ready ========\n");
     printf("Real GGUF weights + SentencePiece BPE tokenizer (see README limits).\n\n");
@@ -117,6 +198,7 @@ void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp, int 
         u32 total = generate_autoregressive(model, caches, input_tokens, in_count,
                                              out_tokens, MAX_GEN_TOKENS, vocab->eos_id,
                                              temp, 0.9f);
+        session_tokens += total - in_count;
 
         printf("Bot:");
         for (u32 i = in_count; i < total; i++) {
@@ -125,6 +207,7 @@ void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp, int 
         }
         printf("\n\n");
     }
+    return session_tokens;
 }
 
 // A short, fixed, ordinary English test corpus -- no file I/O, no network,
@@ -150,12 +233,13 @@ static const char* BENCH_PROMPTS[] = {
 // plus a few known-fact completions as an informational, human-readable
 // spot check (not asserted -- a small model isn't guaranteed to nail every
 // fact even when correctly implemented).
-void run_bench(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
+u32 run_bench(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
     printf("\n======== Correctness Benchmark ========\n");
     printf("Test corpus: \"%s\"\n\n", BENCH_CORPUS);
 
     u32 tokens[256];
     u32 n = text_to_tokens(vocab, BENCH_CORPUS, tokens, 256);
+    u32 session_tokens = n; // the perplexity pass forwards every corpus token once
 
     f32 ppl = compute_perplexity(model, caches, tokens, n);
     f32 ceiling = (f32)model->cfg.vocab_size;
@@ -176,6 +260,7 @@ void run_bench(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
         // --bench's evidence is reproducible run to run.
         u32 total = generate_autoregressive(model, caches, in_tok, in_n, out_tok, 8,
                                              vocab->eos_id, 0.0f, 0.0f);
+        session_tokens += total - in_n;
 
         printf("\"%s\" ->", BENCH_PROMPTS[p]);
         char word[MAX_TOKEN_LEN];
@@ -183,16 +268,18 @@ void run_bench(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
             if (token_to_text(vocab, out_tok[i], word, sizeof(word)) > 0) printf("%s", word);
         printf("\n");
     }
+    return session_tokens;
 }
 
 // GPT-2 has no chat-tuned variant here and no chat template of its own --
 // this is plain raw completion, matching --raw's behavior on the LLaMA
 // path (there's no non-raw mode to compare against for this architecture).
-void gpt2_chat(GPT2Model* model, KVCache* caches, Vocab* vocab, f32 temp) {
+u32 gpt2_chat(GPT2Model* model, KVCache* caches, Vocab* vocab, f32 temp) {
     char user_input[MAX_PROMPT_LEN];
     char word[MAX_TOKEN_LEN];
     u32 input_tokens[MAX_TURN_TOKENS];
     u32 out_tokens[MAX_TURN_TOKENS + MAX_GEN_TOKENS];
+    u32 session_tokens = 0;
 
     printf("\n======== GPT-2 GGUF Completion Engine Ready ========\n");
     printf("Real GGUF weights + byte-level BPE tokenizer, raw completion (no chat template for this arch).\n\n");
@@ -208,20 +295,23 @@ void gpt2_chat(GPT2Model* model, KVCache* caches, Vocab* vocab, f32 temp) {
         for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
         u32 total = gpt2_generate(model, caches, input_tokens, in_count, out_tokens, MAX_GEN_TOKENS,
                                     vocab->eos_id, temp, 0.9f);
+        session_tokens += total - in_count;
 
         printf("Bot:");
         for (u32 i = in_count; i < total; i++)
             if (token_to_text(vocab, out_tokens[i], word, sizeof(word)) > 0) printf("%s", word);
         printf("\n\n");
     }
+    return session_tokens;
 }
 
-void gpt2_bench(GPT2Model* model, KVCache* caches, Vocab* vocab) {
+u32 gpt2_bench(GPT2Model* model, KVCache* caches, Vocab* vocab) {
     printf("\n======== Correctness Benchmark ========\n");
     printf("Test corpus: \"%s\"\n\n", BENCH_CORPUS);
 
     u32 tokens[256];
     u32 n = text_to_tokens(vocab, BENCH_CORPUS, tokens, 256);
+    u32 session_tokens = n;
 
     f32 ppl = gpt2_compute_perplexity(model, caches, tokens, n);
     f32 ceiling = (f32)model->cfg.vocab_size;
@@ -238,12 +328,14 @@ void gpt2_bench(GPT2Model* model, KVCache* caches, Vocab* vocab) {
         u32 out_tok[MAX_TURN_TOKENS + 8];
         for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
         u32 total = gpt2_generate(model, caches, in_tok, in_n, out_tok, 8, vocab->eos_id, 0.0f, 0.0f);
+        session_tokens += total - in_n;
         printf("\"%s\" ->", BENCH_PROMPTS[p]);
         char word[MAX_TOKEN_LEN];
         for (u32 i = in_n; i < total; i++)
             if (token_to_text(vocab, out_tok[i], word, sizeof(word)) > 0) printf("%s", word);
         printf("\n");
     }
+    return session_tokens;
 }
 
 // ==============================================
@@ -255,16 +347,49 @@ int main(int argc, char** argv) {
         run_all_unit_tests();
         return 0;
     }
+    if (argc >= 2 && !strcmp(argv[1], "--list-models")) {
+        print_model_list();
+        return 0;
+    }
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage:\n  %s model.gguf [--temp X] [--raw]\n  %s model.gguf --bench\n  %s --test\n",
-                argv[0], argv[0], argv[0]);
+    const char* model_path;
+    int flags_start; // argv index where --bench/--raw/--temp scanning begins
+
+    if (argc >= 3 && !strcmp(argv[1], "--setup")) {
+        const KnownModel* m = find_known_model(argv[2]);
+        if (!m) {
+            fprintf(stderr, "Unknown model \"%s\" -- run --list-models to see options.\n", argv[2]);
+            return 1;
+        }
+        if (!file_ready(m->filename)) {
+            printf("%s (%s, %s) isn't downloaded yet.\n\nFetch it with:\n\n"
+                   "  curl -L -o %s \"%s\"\n\n"
+                   "Then run this again:  ./llamini --setup %s\n",
+                   m->display_name, m->arch, m->approx_size, m->filename, m->url, m->short_name);
+            return 0;
+        }
+        printf("Found %s locally -- launching.\n", m->filename);
+        model_path = m->filename;
+        flags_start = 3; // "./llamini --setup <name> [--bench] ..."
+    } else if (argc >= 2) {
+        model_path = argv[1];
+        flags_start = 2; // "./llamini model.gguf [--bench] ..."
+    } else {
+        fprintf(stderr,
+            "Usage:\n"
+            "  %s model.gguf [--temp X] [--raw]\n"
+            "  %s model.gguf --bench\n"
+            "  %s --setup <name>      (see --list-models for <name> options)\n"
+            "  %s --list-models\n"
+            "  %s --test\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
+
     int bench_mode = 0;
     int raw_mode = 0;
     f32 temp = 0.0f;
-    for (int i = 2; i < argc; i++) {
+    for (int i = flags_start; i < argc; i++) {
         if (!strcmp(argv[i], "--bench")) bench_mode = 1;
         else if (!strcmp(argv[i], "--raw")) raw_mode = 1;
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = (f32)atof(argv[++i]);
@@ -272,7 +397,7 @@ int main(int argc, char** argv) {
     if (temp > 0.0f) srand((unsigned)time(NULL));
 
     GGUFFile gf;
-    if (gguf_open(argv[1], &gf) != 0) {
+    if (gguf_open(model_path, &gf) != 0) {
         fprintf(stderr, "GGUF load failed\n");
         return -1;
     }
@@ -308,8 +433,15 @@ int main(int argc, char** argv) {
         KVCache* caches = (KVCache*)calloc(cfg.n_layers, sizeof(KVCache));
         for (u32 l = 0; l < cfg.n_layers; l++) kv_cache_init(&caches[l], cfg.dim, cfg.n_ctx);
 
-        if (have_vocab && bench_mode) gpt2_bench(&model, caches, &vocab);
-        else if (have_vocab) gpt2_chat(&model, caches, &vocab, temp);
+        if (have_vocab) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            u32 session_tokens = bench_mode ? gpt2_bench(&model, caches, &vocab)
+                                             : gpt2_chat(&model, caches, &vocab, temp);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+            print_session_summary("gpt2", session_tokens, elapsed);
+        }
 
         for (u32 l = 0; l < cfg.n_layers; l++) { free(caches[l].key); free(caches[l].val); }
         free(caches);
@@ -348,8 +480,15 @@ int main(int argc, char** argv) {
     KVCache* caches = (KVCache*)calloc(cfg.n_layers, sizeof(KVCache));
     for (u32 l = 0; l < cfg.n_layers; l++) kv_cache_init(&caches[l], kv_dim, cfg.seq_len);
 
-    if (have_vocab && bench_mode) run_bench(&model, caches, &vocab);
-    else if (have_vocab) start_chat(&model, caches, &vocab, temp, raw_mode);
+    if (have_vocab) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        u32 session_tokens = bench_mode ? run_bench(&model, caches, &vocab)
+                                         : start_chat(&model, caches, &vocab, temp, raw_mode);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        print_session_summary(arch, session_tokens, elapsed);
+    }
 
     for (u32 l = 0; l < cfg.n_layers; l++) { free(caches[l].key); free(caches[l].val); }
     free(caches);

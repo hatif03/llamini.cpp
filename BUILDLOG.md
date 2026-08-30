@@ -773,3 +773,44 @@ production security fix.
 Commit: `docs: regenerate deps-proof.txt and .zero-dep.toml against current build`
 Commit: `docs: add ARCHITECTURE.md, a beginner-friendly file-by-file guide`
 Commit: `docs: add a "why this exists" motivation section (README + WRITEUP), grounded in verified real-world data`
+
+**A real usability question followed this audit**: if someone actually
+wanted to *use* this tool, how would they get a model in the first place?
+Right now that meant already knowing a working GGUF file's URL. The
+tempting fix — a `--download` flag that fetches one for you — turns out to
+be impossible within this hackathon's own rules: HuggingFace serves only
+over HTTPS, and implementing TLS from scratch is out of scope for a
+weekend; the only two ways around that (a crypto/TLS library, or shelling
+out to `curl`/`wget`) are both explicitly forbidden (a vendored dependency,
+or a "hidden dep" on a separately-installed tool). So the actual fix is a
+guided flow that never hides the network request:
+
+- `--list-models` prints a curated table (name, architecture, params, size)
+  of the four models already verified this session.
+- `--setup <name>` prints the exact copy-pasteable `curl -L -o ... url`
+  command for that model, or — if the file's already present in the current
+  directory — launches straight into it. Every URL was verified before
+  being hardcoded (fetched each one directly, confirmed a real 302 redirect
+  to HuggingFace's CDN with the correct filename in the response headers,
+  not assumed from the repo name + a guessed URL pattern) — this project
+  doesn't ship an unverified claim, including a URL.
+- Every chat/bench session now ends with a self-reported summary: total
+  tokens generated, average tok/s, and peak resident memory via
+  `getrusage()` (POSIX, real numbers this process actually used — no
+  external profiler like `/usr/bin/time -v` needed to see the same number
+  this whole CPU-optimization phase has been trying to shrink). Required
+  threading a token count back out of `start_chat`/`run_bench`/`gpt2_chat`/
+  `gpt2_bench` (all four changed from `void` to returning `u32`) and
+  wrapping each with `clock_gettime` in `main()`.
+
+Verified: rebuilt clean, `--test` unchanged, `--list-models`/`--setup`
+tested for all three cases (already-downloaded, not-yet-downloaded — safely
+simulated by renaming `gpt2.Q4_K_M.gguf` aside and restoring it immediately
+after, unknown model name), and a real GPT-2 `--bench` run producing a
+session summary whose peak-memory number (811MB) matched what
+`/usr/bin/time -v` measured externally for the same file earlier this
+session (~831MB, same order, small run-to-run variance) — the two
+independent measurements agree, which is the actual point of self-reporting
+this rather than asking a reader to trust it.
+
+Commit: `main: add --list-models/--setup and a self-reported end-of-run stats summary`
