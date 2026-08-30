@@ -38,8 +38,18 @@ u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
     struct timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-    for (u32 step = 0; step < max_gen_tokens; step++) {
-        u32 current_pos = total_tokens - 1;
+    // Prefill every prompt position through the full layer stack first (so
+    // each position's KV cache slot is populated by its own real embedding,
+    // not left zeroed) before sampling/appending anything. Processing the
+    // last prompt position (pos == in_token_count - 1) also yields the
+    // first generated token's logits -- that step does double duty, which
+    // is exactly why the three stopping conditions below are each checked
+    // explicitly rather than folded into one precomputed iteration count.
+    u32 pos = 0;
+    u32 max_pos = caches[0].max_seq;
+    for (;;) {
+        if (pos >= max_pos) break;
+        u32 current_pos = pos;
         u32 cur_tok = out_tokens[current_pos];
         memcpy(hidden, model->embeddings->data + (u64)cur_tok * dim, dim * sizeof(f32));
 
@@ -69,9 +79,13 @@ u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
         rms_norm(xnorm, hidden, model->final_norm->data, dim, model->cfg.rms_eps);
         linear(logits, xnorm, model->lm_head->data, dim, model->cfg.vocab_size);
 
+        pos++;
+        if (pos < in_token_count) continue; // still prefilling: no sample, no append
+
         u32 next_tok = greedy_sample(logits, model->cfg.vocab_size);
         out_tokens[total_tokens++] = next_tok;
         if (next_tok == eos_id) break;
+        if (total_tokens - in_token_count >= max_gen_tokens) break;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t_end);

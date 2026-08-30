@@ -30,7 +30,7 @@ Run the in-process unit tests instead of the chat loop:
 
 ## Chat loop
 
-```text
+~~~text
 $ ./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 Loaded GGUF v3 (201 tensors, 23 metadata entries)
 Config: dim=2048 layers=22 heads=32 kv_heads=4 ffn=5632 vocab=32000 seq_len=2048
@@ -39,11 +39,16 @@ Config: dim=2048 layers=22 heads=32 kv_heads=4 ffn=5632 vocab=32000 seq_len=2048
 Real GGUF weights + SentencePiece BPE tokenizer (see README limits).
 
 You: hello
-Bot:. The event, DP, and
+Bot:, world!
+
+```
+
+In this example, the `print` function is used to output the greeting message. The `print` function takes a string as an argument, which is then printed to the console.
+
 
 You: exit
 Bot: Bye!
-```
+~~~
 
 Every architecture number in that `Config:` line (dim, layer count, head
 count, GQA KV-head count, FFN size, vocab size) is read out of the file's
@@ -56,7 +61,14 @@ norm and output projection, greedily decoded back into real vocabulary
 pieces. See [llamini-architecture](.claude/skills/llamini-architecture/SKILL.md)
 for the module map.
 
-Replies are **not** coherent chat responses yet — see Limits below for why.
+Every prompt token is run through the full 22-layer stack before generation
+starts (`generate_autoregressive` prefills the whole prompt into each
+layer's KV cache), so the model actually sees everything you typed, not
+just its last token. Replies are **not** proper chat responses yet — the
+model does raw text completion, not turn-taking (see Limits below) — but
+they're genuine, coherent completions: typing "hello" continues it as if
+finishing a "Hello, world!" code example, which is a real, sensible
+continuation of that text, not noise.
 
 ## Limits (honest, not papered over)
 
@@ -64,23 +76,30 @@ Replies are **not** coherent chat responses yet — see Limits below for why.
   (`<|system|>...<|user|>...<|assistant|>`); this project feeds your raw
   line straight to the tokenizer instead, so the model is doing raw text
   completion, not answering a chat turn. That's why "hello" continues as
-  if it were the start of some other sentence, rather than replying to
-  you. Wiring up the real chat template is the natural next step here.
+  if it were the start of some other piece of text, rather than replying
+  to you as a chatbot would. Wiring up the real chat template is the
+  natural next step here.
 - **Greedy decoding only.** No temperature/top-p/top-k sampling, so output
   is deterministic and can repeat or loop on longer generations.
 - **Single-turn generation.** Each chat line resets every layer's KV cache
   and is generated independently; there is no multi-turn conversational
   memory.
-- **Slow.** `linear()` (the matrix-vector projection every layer uses,
-  `model.c`) and `causal_mha`'s attention are naive scalar loops — no
-  SIMD, no BLAS, no multithreading. Loading the ~638MB Q4_K_M file and
+- **Slow, and prompt length now has a real cost.** `linear()` (the
+  matrix-vector projection every layer uses, `model.c`) is parallelized
+  across output rows with pthreads and gcc now vectorizes its dot-product
+  reduction (conservative fast-math flags, see STDLIB.md/`deps-proof.txt`),
+  but `causal_mha`'s attention is still a naive scalar loop, and this
+  remains far from a production engine. Loading the ~638MB Q4_K_M file and
   dequantizing all ~1.1B parameters to f32 (~4.4GB resident) took anywhere
-  from about 1 to 5 minutes in this project's dev environment (a
-  memory-constrained WSL2 VM); each generated token costs roughly a
-  billion multiply-adds across 22 layers, so expect real per-token
-  latency on modest hardware. A production engine would keep weights
-  quantized and dequantize per-block on the fly, and vectorize the inner
-  loops; this one keeps the code readable instead.
+  from about 25 seconds to several minutes across runs in this project's
+  dev environment (a memory-constrained WSL2 VM) — real measurements
+  varied enough run-to-run that memory/virtualization overhead, not raw
+  arithmetic, looks like the dominant cost there (see `deps-proof.txt`).
+  Generation throughput measured 0.15-0.21 tok/s before threading and
+  1.0-2.1 tok/s after, on that same VM's 12 logical cores. Since prefilling
+  the prompt runs the full forward pass once per prompt token before the
+  first reply token, a long prompt now costs proportionally more time up
+  front than the old (incorrect) O(1)-in-prompt-length behavior did.
 - **Dequantization supports F32, F16, Q4_0, Q4_1, Q8_0, Q4_K, Q6_K** (the
   types an actual Q4_K_M file uses for norms/weights/output). Anything
   else (`Q2_K`, `Q3_K`, `Q5_K`, `Q8_K`, ...) makes `gguf_dequantize_tensor`
