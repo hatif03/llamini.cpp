@@ -1,2 +1,2 @@
 track = "F"
-pitch = "llamini.cpp: a from-scratch C99 llama.cpp core that actually loads and runs a real Q4_K_M GGUF model (hand-rolled GGUF parser, Q4_K/Q6_K dequantizer, 22-layer GQA transformer, SentencePiece-BPE tokenizer) on libc and POSIX alone."
+pitch = "llamini.cpp: a from-scratch C99 llama.cpp core (hand-rolled GGUF parser, 8 quant formats, GQA/MQA transformer, SentencePiece + byte-level BPE tokenizers) that auto-detects and runs 4 real architectures -- LLaMA, Qwen2, GPT-2, Gemma -- and beats real llama.cpp's memory footprint on 3 of them, on libc and POSIX alone."
