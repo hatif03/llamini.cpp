@@ -109,6 +109,8 @@ common.h:  <stdio.h> <stdlib.h> <string.h> <math.h> <unistd.h>
            <ctype.h> <assert.h>
 model.c:   <pthread.h> (file-scoped: "model.c only -- keep the blast radius of
            adding threading small", per its own comment)
+main.c:    <sys/resource.h> (getrusage, POSIX) for the self-reported
+           end-of-run peak-memory summary -- no external profiler needed
 gguf.c:    defines `_POSIX_C_SOURCE 200809L` before its own #include "gguf.h"
            (which pulls in common.h's system headers) -- needed because glibc
            hides posix_fadvise/posix_madvise under -std=c99 without this
@@ -162,13 +164,14 @@ Flags: -Wall -O3 -march=native -fassociative-math -fno-signed-zeros
        -fno-trapping-math -pthread -std=c99 -lm (see section 1)
 
 $ make clean && make && sha256sum llamini *.o
-(build 1)
-0ac7a88058169fc2c1728c330674291a219c6d03fc11853586877706d353875f  llamini
+(build 1 -- regenerated after adding --list-models/--setup and the
+self-reported session-summary feature to main.c)
+82b02335422efdccb5d7a5f6085b9721df4c0bcbabb4decd9b939f6e39e80c95  llamini
 27905bd46db190c253a43029830f52bcfd669b663c1793cc0e7d441ccac20856  generate.o
 e84df7127e37556a408112b89f858872fee31239dd02819f23c8eb969392c6fb  gguf.o
 6be0b4caeeb28877ce0ec771637594c0ad6aff4a7e3bf1b26035ef6dcbb7b00b  gpt2.o
 fa9cab3526de8a7d901d3a12e417f556892a648af583bed0b8f8e615d9791444  kv_cache.o
-83af63a1f5b0a4749baa8755931ed01f794f35d130a4ee322f973984ee343290  main.o
+93a1bb65ba1b86a5a426cf3fd6dd2ae2da95cb603dc368db73130b80fefc66b8  main.o
 b38454724e3524e79c92a3f91b0000e3e7b69bb7bcc8c1e3668612037bb1c331  model.o
 97487ee159c1427f77ecabb620d764722604a620ff1247c5ac12f7f00462f74a  quant.o
 d4b1ab57e7f35f364e0fdf079e782a15ae160cc6123835efea6ea4e8484cfd69  tensor.o
@@ -181,9 +184,11 @@ identical to every line above.
 REPRODUCIBLE: two clean builds from the same source tree, same compiler
 version, same flags, produced a byte-identical llamini binary and every
 byte-identical .o file (9 objects, including gpt2.o — the full current
-SRC list). kv_cache.o and quant.o's hashes are also unchanged from before the
-CPU-optimization pass, exactly as expected since neither file was touched by
-it.
+SRC list). Only main.o and the final llamini binary's hashes changed from
+this file's previous revision (main.c is the only file --list-models/--setup/
+the session-summary feature touched); generate.o/gguf.o/gpt2.o/kv_cache.o/
+model.o/quant.o/tensor.o/tokenizer.o's hashes are unchanged, exactly as
+expected since none of those files were touched by this addition.
 
 Honest caveat: this is same-machine/same-toolchain/same-directory-path
 reproducibility, not a cross-environment guarantee -- gcc embeds the build
@@ -215,3 +220,11 @@ leads with this same point. A `.gguf` model file (section 2) is user-supplied
 runtime input to the resulting binary (`./llamini model.gguf`), exactly like
 any program that opens a file the user provides — not a build dependency, and
 not shipped with or required by the build itself.
+
+`./llamini --list-models` / `--setup <name>` guide a first-time user to an
+actual model without the tool ever performing a network request itself: HTTPS
+(HuggingFace is HTTPS-only) needs TLS, and the only two ways to get that
+without violating this project's rules (a crypto library, or shelling out to
+curl/wget) are both forbidden -- see STDLIB.md's substitution log. `--setup`
+prints the exact `curl` command instead and detects the file via `stat()`
+once you've run it yourself.
