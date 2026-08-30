@@ -19,15 +19,65 @@ naming exactly what running a GGUF model normally requires installing
 replaces each one here, with an upfront, honest scope disclosure of what
 this project is *not*.
 
+## Why this exists
+
+llama.cpp isn't a niche project — it's load-bearing infrastructure. Ollama
+(179.8k GitHub stars, 100M+ Docker pulls) depends on it directly, pulled in
+and patched at build time. `llama-cpp-python` (10.6k stars) is a direct
+binding over it. GPT4All, LM Studio, and text-generation-webui all run it
+under the hood too (see WRITEUP.md for the sourcing on each of these). A
+thought experiment worth taking seriously: the 2024 xz-utils backdoor
+(CVE-2024-3094) was planted by a contributor persona who spent over two
+years building trust before anyone noticed anything wrong — and it was
+caught by one engineer noticing odd SSH timing, not by any scan. If a
+comparably patient compromise ever landed in llama.cpp's own C/C++ instead
+of `sshd`, it wouldn't stay contained to one repo — it would ride along into
+every tool above. This project doesn't claim to replace llama.cpp in any of
+that stack; it's a hackathon-scale reimplementation of the *core*, not a
+production alternative. What it does claim: that the core ideas — GGUF's
+binary layout, block dequantization, attention, RoPE — aren't actually a
+black box that has to be taken on faith from one upstream codebase. They're
+readable, auditable, and reproducible by one person in a weekend.
+
+That's the real motivation, more than the dependency count itself: most
+people working with AI models today operate several layers of abstraction
+above the math — `pip install transformers`, three lines, and the model is
+a black box. This project was built the other way around: no framework, no
+Python, every layer (the file format, the quantization, the linear algebra,
+the tokenizer) written out by hand and understood before it ran. The empty
+dependency manifest is the visible proof of that; [STDLIB.md](STDLIB.md) is
+the receipt for every place a normal stack would `pip install` something
+and this one didn't. None of it is a stunt in the sense of code contorted
+just to avoid an import — it's ordinary, commented C that happens to need
+nothing else, and the honesty sections throughout this README and
+[BUILDLOG.md](BUILDLOG.md) exist so a reader can tell the difference.
+
 ## Build and run
 
 Requires a POSIX environment (Linux, macOS, or WSL/MSYS2 on Windows) — the
 code uses `mmap`/`open`/`fstat`, which plain MinGW does not provide (see
 [STDLIB.md](STDLIB.md)). Verified with `gcc` 15.2.0, C99, on Ubuntu (WSL).
 
+**One command builds a runnable artifact, and verifying it works needs no
+download:**
+
 ```bash
-make clean
 make
+./llamini --test
+```
+
+That's the whole proof. `--test` builds a small synthetic model entirely
+in memory (hand-populated tensors, zero file I/O) and runs every unit test —
+matmul, RMSNorm, RoPE, a full grouped-query-attention forward pass, malformed-
+GGUF rejection — in-process. No `.gguf` file, no internet connection, no
+multi-gigabyte download required to confirm the build produced a working
+binary. A `.gguf` model path is **runtime input you supply**, the same way
+`cat somefile.txt` needs `somefile.txt` to exist — it's not a build
+dependency, and this project doesn't ship one (a real model is 100MB-2GB+;
+bundling one would be a strange thing for a Makefile to require). Once you
+do have one (download links below), everything else in this README follows:
+
+```bash
 ./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
@@ -36,12 +86,6 @@ for temperature + top-p=0.9 nucleus sampling instead:
 
 ```bash
 ./llamini tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --temp 0.8
-```
-
-Run the in-process unit tests instead of the chat loop:
-
-```bash
-./llamini --test
 ```
 
 Run the quantitative correctness benchmark (see "Correctness evidence"

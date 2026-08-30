@@ -694,3 +694,82 @@ Cleaned up the scratch llama.cpp build (`rm -rf ~/llama.cpp-bench`, 324MB)
 once its numbers were captured — it was never meant to persist.
 
 Commit: `docs: add real head-to-head benchmarks against llama.cpp + landscape comparison table`
+
+---
+
+## Phase 6 — final submission audit (2026-08-31)
+
+Asked to check bonus-point eligibility, resolve a worry about the "single
+command, runnable artifact" build requirement, and write a beginner-friendly
+codebase guide before submitting.
+
+**Bonus-point audit.** Read the hackathon's own rule files directly
+(`.claude/skills/zero-dep-hackathon/SKILL.md`,
+`.claude/skills/hackathon-submit/SKILL.md`) rather than guess at the scoring
+rubric. Confirmed bonuses: Single File +5, Reproducible Build +5, Package
+Killer +3, STDLIB Log +3. Package Killer and STDLIB Log were already
+satisfied. Single File was deliberately not pursued — the skill's own text
+says "do not flatten this tree unless the user asks," and doing it anyway
+would cost more on Code Quality & Idiom (25% of the total score) than +5 is
+worth.
+
+**`deps-proof.txt` was found stale, and this was the real finding of this
+pass.** It predated `gpt2.c` being added to the Makefile's `SRC` list
+entirely — the build transcript and the reproducible-build sha256 hash list
+both compiled/linked only 8 of the current 9 source files. It also described
+the pre-thread-pool `pthread_create`-per-call design instead of the current
+persistent `ThreadPool`, and never mentioned `_POSIX_C_SOURCE`/
+`posix_fadvise`/`posix_madvise` at all. Regenerated it end to end against a
+real, current `make clean && make`: fresh build transcript (9 files), a
+fresh real-model chat transcript, `ldd` output re-verified (still only
+`libc`/`libm`, no separate `libpthread.so` — this glibc merges pthread
+symbols into `libc.so.6`), and two fresh clean-build sha256 sets confirming
+byte-identical output including `gpt2.o` — `kv_cache.o`/`quant.o`'s hashes
+came back identical to the stale file's own values, exactly as expected
+since the CPU-optimization pass never touched either file. `.zero-dep.toml`'s
+one-line pitch was also stale (TinyLlama-only, pre-multi-architecture,
+pre-optimization) — refreshed to describe the current scope.
+
+**The "works on my machine" worry turned out to be unfounded, not something
+to route around.** No such phrasing exists in the hackathon's actual rules —
+the real requirement is just "Makefile: one command → runnable llamini,"
+and the documented example run already includes `--test` as an alternative
+to a model path. `--test` needs zero external files (a synthetic in-memory
+model, no file I/O at all), so `make && ./llamini --test` was already a
+complete, self-contained, single-command proof requiring no download — this
+wasn't a gap to fix, just a fact that needed to be impossible to miss in
+README's "Build and run," which now leads with it explicitly instead of
+leading with a model-path example that implies a download is required first.
+
+**Added `ARCHITECTURE.md`** — a beginner-friendly, human-voiced file-by-file
+guide (distinct from `.claude/skills/llamini-architecture/SKILL.md`, which is
+written for an AI assistant and reads very differently): a one-paragraph
+pipeline summary, a walkthrough of one real invocation through the actual
+call chain with an ASCII diagram, a file-by-file reference table, and a
+"where do I look for X" quick-reference section. Cross-checked every
+function/file name it cites against the real current source (not memory of
+an earlier version) before committing.
+
+**Added a "why this exists" motivation section** (README.md and an expanded
+"why I built this" section in WRITEUP.md), grounded in a research pass that
+verified real facts before writing anything — this project already learned
+the cost of an unverified AI-search citation once (Phase 2) and wasn't going
+to repeat it. Confirmed via direct fetches (not search summaries): Ollama
+depends on llama.cpp via a pinned-commit fetch + patch layer at build time
+(179.8k stars, 100M+ Docker pulls), `llama-cpp-python`/GPT4All/LM Studio/
+text-generation-webui all run it too, and — checked specifically because it
+would have been an easy wrong guess — **vLLM does not** depend on llama.cpp
+at all (separate engine, no evidence of any dependency found). Grounded the
+supply-chain thought experiment in real, verified incidents: the 2024
+xz-utils/liblzma backdoor (CVE-2024-3094, discovered by one engineer
+noticing anomalous SSH timing, not a scan), the 2020 SolarWinds Orion
+compromise (~18,000 of ~33,000 customers), and the closest verified
+AI/ML-specific precedent, PyTorch's own December 2022 disclosure of a
+malicious `torchtriton` PyPI package. Deliberately did not overclaim: the
+write-up states plainly that llamini.cpp does not replace llama.cpp in any
+of that stack, and frames the value as legibility/auditability, not a
+production security fix.
+
+Commit: `docs: regenerate deps-proof.txt and .zero-dep.toml against current build`
+Commit: `docs: add ARCHITECTURE.md, a beginner-friendly file-by-file guide`
+Commit: `docs: add a "why this exists" motivation section (README + WRITEUP), grounded in verified real-world data`

@@ -18,6 +18,87 @@ I built this with Claude Code as a pair programmer. This is the honest
 account of how it actually went — including the parts that didn't work the
 first time.
 
+## Why I built this, not just that I could
+
+Two reasons, and I want to be specific about both rather than wave at
+"dependencies are bad."
+
+**The first is a supply-chain argument, and I want to ground it in real
+numbers rather than assert it.** llama.cpp is not a niche project sitting
+in some corner of GitHub — it's load-bearing. Ollama depends on it directly
+(pulled in and patched at build time, confirmed by reading Ollama's own
+build directory, not a vendored copy) and Ollama itself has 179.8k GitHub
+stars and its official Docker image has logged over 100 million pulls.
+`llama-cpp-python` (10.6k stars) is a direct binding over it. GPT4All ships,
+in their own README's words, "a Python client around llama.cpp
+implementations." text-generation-webui installs prebuilt llama.cpp
+binaries. LM Studio's own blog credits "our llama.cpp engine." That's five
+real, independently-verifiable dependents, several of them extremely
+widely deployed, all resting on one C/C++ codebase. (I checked, specifically,
+whether vLLM belongs on this list — it doesn't. It's a separate inference
+engine with its own team and its own attention implementation. Saying
+otherwise would have been exactly the kind of unverified claim that already
+burned me once earlier in this project, so I'm naming the one I ruled out,
+not just the ones that fit the story.)
+
+Here's the thought experiment. In 2024, someone spent **over two years**
+building a trusted reputation as a contributor to xz-utils, a compression
+library almost nobody thinks about, before landing a backdoor in `liblzma`
+that would have compromised SSH access on a huge fraction of the internet's
+Linux servers (CVE-2024-3094, CVSS 10.0 — the maximum score). It wasn't
+caught by a security scan. It was caught by one engineer at Microsoft/
+PostgreSQL noticing that SSH logins were taking a few hundred milliseconds
+longer than they should, and refusing to let that go. Now replace "SSH
+server nobody thinks about" with "the C++ inference engine every local-LLM
+tool on your laptop is quietly running." The pattern doesn't require
+anything exotic — patient social engineering, one maintainer's trust, a
+subtle enough change that normal review doesn't catch it — and the same
+kind of blast radius (real damage: the 2020 SolarWinds Orion compromise hit
+roughly 18,000 of SolarWinds' 33,000 Orion customers through a poisoned
+build pipeline; the closest AI-specific precedent I could verify, PyTorch's
+own December 2022 disclosure of a malicious `torchtriton` package on PyPI,
+exfiltrated SSH keys and git credentials from anyone who happened to
+install a nightly build before it was caught).
+
+I'm not going to overstate what this project proves. llamini.cpp does not
+replace llama.cpp inside Ollama, GPT4All, or anything else on that list —
+it's a hackathon-scale reimplementation of the *core*, run against
+1.1B-2.5B-parameter models on a laptop-class VM, not a production
+inference engine. What it does demonstrate is narrower and, I think, still
+worth doing: that the actual ideas inside that trusted C++ codebase — GGUF's
+binary layout, block-quantized dequantization, RoPE, grouped-query
+attention — are not actually a black box that has to be taken on faith.
+One person, in a weekend, can read the real format, implement the real
+math, and end up with something that produces recognizably correct output.
+That legibility has value independent of whether this specific binary
+ever runs in anyone's production stack.
+
+**The second reason is more personal, and it's the one that actually got me
+to start.** Most people working with AI models today — myself included,
+most of the time — operate a long way above the actual math. `pip install
+transformers`, three lines of Python, and a model is running; it's a black
+box you feed strings and get strings back from, and the moment something
+doesn't work the instinct is to reach for another package, not to open the
+one you already have. I wanted to build this the other way around: no
+framework, no Python runtime, no library standing between me and the
+actual bytes of a `.gguf` file. Every layer — the binary format, the
+quantization block layout, the attention math, the tokenizer's merge rules —
+written out by hand and understood well enough to explain, not copy-pasted
+from a tutorial. The empty dependency manifest is the visible proof of
+that; [STDLIB.md](STDLIB.md) is the itemized receipt for every place a
+normal stack would `pip install` something and this one didn't.
+
+I want to be honest about the difference between "avoided dependencies" and
+"did something worth doing," because they aren't automatically the same
+thing. Nothing in this codebase is contorted or obfuscated purely to dodge
+an import — there's no macro trick or unreadable one-liner whose only
+purpose is "look, no `pip install`." It's ordinary, commented C, built the
+way I'd build it if dependencies weren't a scoring category at all, that
+happens to need nothing beyond libc and POSIX. The honesty sections
+throughout this write-up, the README, and [BUILDLOG.md](BUILDLOG.md) exist
+so a reader can tell the difference between "intentional" and "a stunt" for
+themselves, rather than take my word for it.
+
 ## What I reimplemented
 
 Everything a real `llama.cpp`-class inference stack needs, minus the parts
