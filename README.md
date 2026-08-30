@@ -170,6 +170,53 @@ format — Qwen models actually use a different convention, ChatML
 correctly regardless of chat template, and is what the comparison table
 above uses for a fair, template-independent measurement.)
 
+## Benchmarks
+
+Real head-to-head numbers against real llama.cpp — not a public number cited
+from somewhere else. Built unmodified upstream llama.cpp
+(`ggml-org/llama.cpp`, commit `0b5be7e`) from source on this same machine,
+in a scratch directory entirely outside this repo, never vendored or
+shipped (see STDLIB.md), and ran `llama-bench` against the exact same GGUF
+files this project already uses.
+
+| Model | llamini RSS | llama.cpp RSS | llamini tok/s\* | llama.cpp tok/s (tg32) |
+| --- | --- | --- | --- | --- |
+| TinyLlama-1.1B | ~710 MB | ~1.12 GB | 0.41-0.67 | 0.80 ± 0.40 |
+| Qwen2.5-0.5B | ~480 MB | ~558 MB | 0.95-1.24 | 0.69 ± 0.21 |
+| GPT-2-124M | ~831 MB | ~169 MB | 4.80-8.32 | 0.56 ± 0.31 |
+| Gemma-2b | ~1.54 GB | ~2.66 GB | not measured | 1.78 ± 2.19 |
+
+\* llamini's own numbers are `--bench`'s per-completion tok/s (8 tokens,
+including that call's prompt prefill) — not the same measurement as
+llama.cpp's `tg32` (pure decode, no prompt processing), so read this as
+directional context, not a precise ratio; the two aren't measuring
+identical work. llama.cpp's own ± is its `-r 3` repetition spread, and it's
+often larger than the mean (Gemma's 1.78 ± 2.19) — this dev VM's
+memory/virtualization overhead dominates for *both* engines, not just this
+one, which is itself a useful, honest data point about how much these
+numbers should or shouldn't be extrapolated to other hardware.
+
+**The honest, nuanced result:** llamini.cpp's resident memory beats real
+llama.cpp's on 3 of 4 models (TinyLlama, Qwen2.5, Gemma-2b) on this exact
+machine — plausibly because llama.cpp pre-allocates a KV cache and batch
+buffers sized for a much larger default context than this project bothers
+with, while the CPU optimization pass (see Limits) means llamini no longer
+pays for a fully-materialized `f32` copy of every weight either. It loses
+on GPT-2 (831MB vs 169MB) for a disclosed reason, not a mystery: GPT-2's
+own weights (`gpt2.c`) were not brought into this pass's on-demand
+dequantization — only the LLaMA-family path (`model.c`, shared by
+LLaMA/Qwen2/Gemma) was. Generation speed is closer and noisier: llamini
+measured faster on Qwen2.5 and dramatically faster on tiny GPT-2, slower on
+TinyLlama, on a benchmark methodology gap disclosed above — not a claim
+that llamini out-executes a mature, years-tuned inference engine in
+general.
+
+See STDLIB.md for the landscape comparison against `llama2.c` (the closest
+genuinely from-scratch comparator) and `llamafile` (which vendors
+llama.cpp/ggml wholesale) on dependency footprint and architecture
+generality, and BUILDLOG.md's CPU optimization phase for the full research
+and methodology.
+
 ## Limits (honest, not papered over)
 
 - **Four architectures, all now verified end-to-end.** `llama`, `qwen2`,

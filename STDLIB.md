@@ -72,3 +72,43 @@ least one of these:
 - **Mistral and Gemma2 were not attempted at all.** Mistral's GGUF architecture is literally `"llama"` (it would load with the existing code, demonstrating no new capability); Gemma2 has real added complexity (logit/attention softcapping, sliding-window attention, a `head_dim` that isn't `dim/n_heads`) for the same memory cost as Gemma1. Neither is a stdlib gap — both are scoping decisions, not missing infrastructure.
 - **No Qwen-family (ChatML) chat template.** Qwen2 uses `<|im_start|>`/`<|im_end|>`, a different convention from TinyLlama-Chat's `<|system|>/<|user|>/<|assistant|>` that `build_chat_prompt_tokens` implements. Not built; Qwen2.5 is exercised here in raw-completion mode only.
 - **No true quantized dot product, and the lazy path isn't thread-pooled.** `linear_lazy()` (`model.c`) still converts each row-chunk to `f32` before the dot product, unlike ggml's real int8×int8 kernels that never produce a float until the final scaled sum — this project's version buys the memory-footprint and bandwidth win without the integer-SIMD complexity, at the cost of some avoidable float conversion work. It's also deliberately serial, not dispatched to the thread pool: chunking by a fixed row count (not thread count) is what keeps peak transient memory bounded regardless of a tensor's width (critical for Gemma's 256128-row embedding table — see BUILDLOG.md's CPU optimization phase for the reasoning), and CPU batch-1 inference being memory-bandwidth-bound means N threads racing for the same bytes isn't an obvious win anyway. Revisit with per-worker scratch buffers if a real profile ever shows otherwise. Each chunk's scratch buffer is also a plain `malloc`/`free` per call rather than a reused per-tensor buffer — simpler, correct, but real allocator churn on the hot path.
+- **`gpt2.c`'s weights were not brought into the on-demand dequantization pass.** Only the LLaMA-family path (`model.c`, shared by LLaMA/Qwen2/Gemma) got lazy tensors; GPT-2 still fully dequantizes to `f32` at load time. Measured effect: GPT-2's resident memory (~831MB) is actually *higher* than real llama.cpp's for the same file (~169MB) — see README's "Benchmarks". A scoping decision (GPT-2's weights are tiny, ~124M params, so the absolute cost is small), not an oversight, but disclosed rather than left for a reader to discover by comparing the numbers themselves.
+
+## Benchmark methodology (not a project dependency)
+
+README's "Benchmarks" section cites real numbers from an unmodified,
+upstream `llama.cpp` (`ggml-org/llama.cpp`, commit `0b5be7e`), built from
+source with `cmake` purely to generate comparison data on this same
+machine. This is **not vendored, not shipped, not referenced by any code
+path in this project, and never invoked by the submitted binary** — it was
+cloned and built once, by hand, in a scratch directory entirely outside
+this repo (`~/llama.cpp-bench` in WSL, never under `d:\llamini.cpp`), run
+directly (`llama-bench`), and its output copied into README/this file as
+data. The zero-dependency rule (`AGENTS.md`'s "No hidden deps": don't
+`system()`/`popen` a separately-installed tool) governs what the *shipped
+program* does at runtime — it says nothing about a developer building a
+reference implementation once, by hand, to get honest comparison numbers,
+any more than the research agents that read real ggml source this session
+made ggml a dependency of this project. `cmake` was installed in WSL
+(`apt-get install cmake`) specifically to build that external reference; it
+is not required to build or run llamini.cpp itself (see the Makefile —
+`gcc`/`make` only).
+
+**Landscape comparison** (researched, not independently rebuilt/benchmarked
+on this machine for the non-llama.cpp rows — see BUILDLOG.md's CPU
+optimization phase for sourcing):
+
+| Project | Vendored ML source | Architectures (from-scratch, no vendoring) | Build tools |
+| --- | --- | --- | --- |
+| **llamini.cpp** | 0 bytes | 4, auto-detected from GGUF metadata | `gcc`/`make` only |
+| `llama2.c` (karpathy) | 0 bytes | 1, hardcoded (Llama-2 shape, custom `.bin` format, no GGUF) | `gcc`/`make` only |
+| `llama.cpp` | n/a (it's the reference) | many, via `ggml`'s own graph engine | `cmake` + a C++ compiler |
+| `llamafile` | ~26MB (`llama.cpp`+`ggml` vendored as a git submodule) | inherits llama.cpp's | its own cosmocc toolchain |
+
+The honest framing: `llama2.c` is the only other genuinely from-scratch,
+zero-vendored comparator, and it's smaller in raw line count than this
+project — the defensible claim isn't "fewer lines," it's **architecture
+generality per line**: 4 GGUF-metadata-auto-detected architectures here
+vs. `llama2.c`'s 1 architecture hardcoded regardless of size. Against
+`llamafile`, the clean claim is genuinely zero vendored ML source (0 bytes)
+vs. a real, git-submodule-pinned dependency.

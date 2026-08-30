@@ -637,3 +637,60 @@ system header — already covered above, re-confirmed working here since this
 step rebuilds on top of it.
 
 Commit: `gguf+model+tensor: dequantize weight rows on demand instead of materializing f32 upfront`
+
+**Step 4: real head-to-head benchmarks against real llama.cpp.** The user
+asked for a "more vast comparison and benchmark," and this project already
+has one hard-earned lesson about unverifiable numbers (Phase 2's fabricated
+search citation) — so rather than cite a public llama.cpp benchmark, built
+real, unmodified upstream llama.cpp (`ggml-org/llama.cpp`, commit
+`0b5be7e`) from source, entirely outside this repo (`~/llama.cpp-bench` in
+WSL), asked before installing `cmake` (a system-wide package, per this
+session's own risk-confirmation practice), and ran `llama-bench` against
+the exact same four GGUF files this project already uses. This is
+disclosed in STDLIB.md as methodology, not a project dependency — never
+vendored, never shipped, never referenced by any code path.
+
+Results (`-p 0 -n 32 -r 3 -t 12`, i.e. pure 32-token decode, no prompt
+processing, on this same 12-logical-core dev VM):
+
+| Model | llamini RSS | llama.cpp RSS | llamini tok/s (incl. prefill) | llama.cpp tok/s (tg32) |
+| --- | --- | --- | --- | --- |
+| TinyLlama-1.1B | ~710MB | ~1.12GB | 0.41-0.67 | 0.80 ± 0.40 |
+| Qwen2.5-0.5B | ~480MB | ~558MB | 0.95-1.24 | 0.69 ± 0.21 |
+| GPT-2-124M | ~831MB | ~169MB | 4.80-8.32 | 0.56 ± 0.31 |
+| Gemma-2b | ~1.54GB | ~2.66GB | not measured | 1.78 ± 2.19 |
+
+The honest, nuanced finding: llamini.cpp's resident memory beats real
+llama.cpp's on 3 of 4 models on this exact machine (TinyLlama, Qwen2.5,
+Gemma-2b) — plausibly because llama.cpp pre-allocates a KV cache and batch
+buffers sized for a larger default context, on top of its own
+already-efficient quantized-weight access, while this project's step 3
+change means it no longer pays for a fully-materialized f32 copy of every
+weight either. It loses clearly on GPT-2 (831MB vs 169MB) for a disclosed,
+non-mysterious reason: `gpt2.c`'s weights were never brought into the
+on-demand dequantization pass this session, only `model.c`'s LLaMA-family
+path was (a scoping decision, not an oversight — noted in STDLIB.md).
+Generation speed comparisons are noisier and not perfectly apples-to-apples
+(llamini's own number includes each call's prompt prefill; llama.cpp's
+`tg32` is pure decode with no prompt processing) — llamini measured faster
+on Qwen2.5 and GPT-2, slower on TinyLlama, and llama.cpp's own repetition
+spread (`±`) was frequently larger than its mean (Gemma: 1.78 ± 2.19),
+which is itself informative: this dev VM's memory/virtualization overhead
+dominates for *both* engines, not just this project's, so these numbers
+should read as "measured once, honestly, on one noisy machine," not
+extrapolated as a general performance claim.
+
+Also recorded a landscape comparison (researched this session, not
+independently rebuilt on this machine): `llama2.c` (karpathy) is the only
+other genuinely from-scratch, zero-vendored comparator (~700-2500 lines, 1
+hardcoded architecture, custom format, no GGUF); `llamafile` vendors
+`llama.cpp`+`ggml` wholesale (~26MB, a real dependency by any honest
+reading). The defensible claims: architecture-generality-per-line (4
+GGUF-auto-detected architectures here vs. `llama2.c`'s 1, regardless of
+raw line count) and genuinely zero vendored ML source vs. `llamafile`'s
+real vendoring.
+
+Cleaned up the scratch llama.cpp build (`rm -rf ~/llama.cpp-bench`, 324MB)
+once its numbers were captured — it was never meant to persist.
+
+Commit: `docs: add real head-to-head benchmarks against llama.cpp + landscape comparison table`
