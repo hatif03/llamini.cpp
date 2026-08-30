@@ -64,15 +64,16 @@ void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32
     u32 ffn = model->cfg.ffn_dim;
     u32 n_heads = model->cfg.n_heads;
     u32 n_heads_kv = model->cfg.n_heads_kv;
-    u32 head_dim = dim / n_heads;
+    u32 head_dim = model->cfg.head_dim;
     u32 kv_dim = n_heads_kv * head_dim;
+    u32 q_dim = n_heads * head_dim;
 
     f32* hidden    = (f32*)malloc(dim * sizeof(f32));
     f32* xnorm     = (f32*)malloc(dim * sizeof(f32));
-    f32* q         = (f32*)malloc(dim * sizeof(f32));
+    f32* q         = (f32*)malloc(q_dim * sizeof(f32));
     f32* k         = (f32*)malloc(kv_dim * sizeof(f32));
     f32* v         = (f32*)malloc(kv_dim * sizeof(f32));
-    f32* attn_out  = (f32*)malloc(dim * sizeof(f32));
+    f32* attn_out  = (f32*)malloc(q_dim * sizeof(f32));
     f32* attn_proj = (f32*)malloc(dim * sizeof(f32));
     f32* gate      = (f32*)malloc(ffn * sizeof(f32));
     f32* up        = (f32*)malloc(ffn * sizeof(f32));
@@ -80,26 +81,33 @@ void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32
     f32* ffn_out   = (f32*)malloc(dim * sizeof(f32));
 
     memcpy(hidden, model->embeddings->data + (u64)token_id * dim, dim * sizeof(f32));
+    if (model->cfg.embedding_scale != 1.0f)
+        for (u32 d = 0; d < dim; d++) hidden[d] *= model->cfg.embedding_scale;
 
     for (u32 l = 0; l < model->cfg.n_layers; l++) {
         DecoderLayer* layer = &model->layers[l];
 
         rms_norm(xnorm, hidden, layer->attn_norm->data, dim, model->cfg.rms_eps);
-        linear(q, xnorm, layer->q_proj->data, dim, dim);
+        linear(q, xnorm, layer->q_proj->data, dim, q_dim);
         linear(k, xnorm, layer->k_proj->data, dim, kv_dim);
         linear(v, xnorm, layer->v_proj->data, dim, kv_dim);
+        if (model->cfg.qkv_bias) {
+            add_bias(q, layer->q_bias->data, q_dim);
+            add_bias(k, layer->k_bias->data, kv_dim);
+            add_bias(v, layer->v_bias->data, kv_dim);
+        }
 
-        rope(q, pos, dim, head_dim, model->cfg.rope_freq_base);
-        rope(k, pos, kv_dim, head_dim, model->cfg.rope_freq_base);
+        rope(q, pos, q_dim, head_dim, model->cfg.rope_freq_base, model->cfg.rope_type);
+        rope(k, pos, kv_dim, head_dim, model->cfg.rope_freq_base, model->cfg.rope_type);
 
         causal_mha(q, k, v, &caches[l], attn_out, pos, n_heads, n_heads_kv, head_dim);
-        linear(attn_proj, attn_out, layer->o_proj->data, dim, dim);
+        linear(attn_proj, attn_out, layer->o_proj->data, q_dim, dim);
         for (u32 d = 0; d < dim; d++) hidden[d] += attn_proj[d];
 
         rms_norm(xnorm, hidden, layer->ffn_norm->data, dim, model->cfg.rms_eps);
         linear(gate, xnorm, layer->gate_proj->data, dim, ffn);
         linear(up,   xnorm, layer->up_proj->data,   dim, ffn);
-        swiglu(ffn_hid, gate, up, ffn);
+        ffn_glu(ffn_hid, gate, up, ffn, model->cfg.ffn_act);
         linear(ffn_out, ffn_hid, layer->down_proj->data, ffn, dim);
         for (u32 d = 0; d < dim; d++) hidden[d] += ffn_out[d];
     }

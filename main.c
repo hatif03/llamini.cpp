@@ -218,11 +218,19 @@ int main(int argc, char** argv) {
            gf.hdr.version, (unsigned long long)gf.hdr.n_tensors, (unsigned long long)gf.hdr.n_metadata);
 
     // TinyLlama-1.1B-shaped defaults, used only for keys the file doesn't
-    // define; every value the file does define overrides these.
-    LLaMAConfig defaults = {2048, 22, 32, 32, 5632, 32000, MAX_SEQ_LEN, 1e-5f, 10000.0f};
-    LLaMAConfig cfg = llama_config_from_gguf(&gf, defaults);
-    printf("Config: dim=%u layers=%u heads=%u kv_heads=%u ffn=%u vocab=%u seq_len=%u\n",
-           cfg.dim, cfg.n_layers, cfg.n_heads, cfg.n_heads_kv, cfg.ffn_dim, cfg.vocab_size, cfg.seq_len);
+    // define; every value the file does define overrides these. Designated
+    // initializers (not positional) so adding a field to LLaMAConfig can't
+    // silently misalign this list.
+    LLaMAConfig defaults = {
+        .dim = 2048, .n_layers = 22, .n_heads = 32, .n_heads_kv = 32,
+        .ffn_dim = 5632, .vocab_size = 32000, .seq_len = MAX_SEQ_LEN,
+        .rms_eps = 1e-5f, .rope_freq_base = 10000.0f,
+    };
+    char* arch = NULL;
+    LLaMAConfig cfg = llama_config_from_gguf(&gf, defaults, &arch);
+    printf("Config: arch=%s dim=%u layers=%u heads=%u kv_heads=%u head_dim=%u ffn=%u vocab=%u seq_len=%u\n",
+           arch ? arch : "?", cfg.dim, cfg.n_layers, cfg.n_heads, cfg.n_heads_kv,
+           cfg.head_dim, cfg.ffn_dim, cfg.vocab_size, cfg.seq_len);
 
     LLaMAModel model;
     if (llama_model_init(&model, &cfg) != 0) { gguf_close(&gf); return -1; }
@@ -239,8 +247,7 @@ int main(int argc, char** argv) {
     if (!have_vocab)
         fprintf(stderr, "warning: no tokenizer vocab in this GGUF file; chat disabled\n");
 
-    u32 head_dim = cfg.dim / cfg.n_heads;
-    u32 kv_dim = cfg.n_heads_kv * head_dim;
+    u32 kv_dim = cfg.n_heads_kv * cfg.head_dim;
     KVCache* caches = (KVCache*)calloc(cfg.n_layers, sizeof(KVCache));
     for (u32 l = 0; l < cfg.n_layers; l++) kv_cache_init(&caches[l], kv_dim, cfg.seq_len);
 
@@ -249,6 +256,7 @@ int main(int argc, char** argv) {
 
     for (u32 l = 0; l < cfg.n_layers; l++) { free(caches[l].key); free(caches[l].val); }
     free(caches);
+    free(arch);
     if (have_vocab) vocab_free(&vocab);
     gguf_close(&gf);
     llama_model_free(&model);
@@ -279,8 +287,11 @@ void test_rms_norm() {
 void test_rope() {
     printf("\n[RoPE Test]\n");
     f32 q[]={1,1,1,1,1,1,1,1};
-    rope(q,5,8,4,10000.0f);
+    rope(q,5,8,4,10000.0f,ROPE_NORM);
     for(int i=0;i<8;i++) printf("%.2f ",q[i]); printf("\n");
+    f32 q2[]={1,1,1,1,1,1,1,1};
+    rope(q2,5,8,4,10000.0f,ROPE_NEOX);
+    for(int i=0;i<8;i++) printf("%.2f ",q2[i]); printf("\n");
 }
 
 void test_kv_cache() {
@@ -307,7 +318,12 @@ void test_generate() {
     // Tiny synthetic model (not loaded from a file) exercising the full
     // per-layer forward pass, including a non-trivial GQA shape
     // (4 query heads sharing 2 KV heads), without needing a real GGUF.
-    LLaMAConfig cfg = {16, 1, 4, 2, 32, 8, 32, 1e-5f, 10000.0f};
+    LLaMAConfig cfg = {
+        .dim = 16, .n_layers = 1, .n_heads = 4, .n_heads_kv = 2, .head_dim = 4,
+        .ffn_dim = 32, .vocab_size = 8, .seq_len = 32,
+        .rms_eps = 1e-5f, .rope_freq_base = 10000.0f,
+        .rope_type = ROPE_NORM, .ffn_act = ACT_SILU, .qkv_bias = 0, .embedding_scale = 1.0f,
+    };
     LLaMAModel model;
     assert(llama_model_init(&model, &cfg) == 0);
 
@@ -325,8 +341,7 @@ void test_generate() {
     for (u32 i = 0; i < layer->up_proj->size; i++) layer->up_proj->data[i] = (f32)((i % 5) - 2) * 0.05f;
     for (u32 i = 0; i < layer->down_proj->size; i++) layer->down_proj->data[i] = (f32)((i % 5) - 2) * 0.05f;
 
-    u32 head_dim = cfg.dim / cfg.n_heads;
-    u32 kv_dim = cfg.n_heads_kv * head_dim;
+    u32 kv_dim = cfg.n_heads_kv * cfg.head_dim;
     KVCache cache;
     kv_cache_init(&cache, kv_dim, cfg.seq_len);
 

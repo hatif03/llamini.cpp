@@ -295,3 +295,79 @@ doesn't depend on its output filename) and reworded every "mini llama.cpp"
 phrase across the repo, including two files (`.cursor/`'s mirrors of the
 `.claude/` skill docs) that had drifted stale relative to their `.claude/`
 counterparts since Phase 2 and needed resyncing anyway.
+
+## Phase 4 — other model families (2026-08-30, ongoing)
+
+Asked to identify and run a variety of small models across different
+architecture families (not just LLaMA), to show the engine isn't
+TinyLlama-specific. Researched real, currently-available small GGUF models
+across Gemma/BERT/GPT/Mistral/Qwen by reading llama.cpp's own source
+(`gguf-py/gguf/constants.py`, `src/models/*.cpp`, `conversion/*.py`) rather
+than guessing — this surfaced two real, cross-cutting requirements no one
+would find just by staring at TinyLlama's file: (1) Qwen2/Gemma/Gemma2 use
+the "NEOX" RoPE pairing convention (elements paired half a head-dim apart),
+not the "NORM" pairing (adjacent elements) this project's `rope()` already
+had — getting this wrong doesn't crash, it produces fluent-looking *wrong*
+output, the worst kind of bug; (2) Qwen2/GPT-2 use byte-level BPE with an
+explicit merges list and no per-token scores, a genuinely different vocab
+convention from the SentencePiece format already built, not a config tweak.
+
+**Decision on scope** (research findings, then a direct ask rather than
+guessing): Mistral's GGUF `architecture` is literally `"llama"` — it would
+load with zero new code, which also means it demonstrates zero real
+diversity, and the smallest real Mistral checkpoint is 7B (~28GB as f32)
+anyway, so skipped entirely. Gemma2's extra quirks (attention/logit
+softcapping, sliding-window/full-attention alternation, a `head_dim` that
+doesn't equal `dim/n_heads`) cost real new code for the same RAM ceiling as
+Gemma1, so skipped. BERT is real and mainstream in GGUF (contrary to an
+initial assumption) but is a fundamentally different product — no causal
+mask, no KV cache, a pooled embedding output instead of next-token logits —
+so deferred as a stretch goal, not attempted this pass. Chose Qwen2.5-0.5B,
+GPT-2-124M, and Gemma-2b as the three targets, with Gemma explicitly
+expected to be untestable end-to-end on this dev machine's 7.6GB RAM (its
+~10-12GB f32 footprint doesn't fit) — write the code, disclose that
+honestly, don't force a run that will thrash or fail.
+
+**Shared infrastructure, verified against the existing TinyLlama path
+before touching anything new:** extended `LLaMAConfig` with `head_dim`
+(read from an explicit `<arch>.attention.key_length` key when present,
+never re-derived as `dim/n_heads` and assumed correct — that derivation
+happens to hold for every architecture supported here, but is documented as
+not holding in general, e.g. gemma2), `rope_type`, `ffn_act` (SiLU vs GELU
+— SwiGLU and GeGLU are the same shape, only the gate activation differs),
+`qkv_bias`, and `embedding_scale`. Added `gguf_get_str` (a scalar-string
+metadata accessor `gguf.c` didn't have yet — needed to read
+`general.architecture` itself) and made `llama_config_from_gguf` build its
+metadata key names as `"<arch>.<suffix>"` instead of a hardcoded `"llama."`
+prefix, since every architecture's hyperparameters live under its own
+namespace. Also fixed a real, independent bug the research surfaced:
+`llama_load_weights` was dequantizing `token_embd.weight` into `lm_head` a
+*second* time whenever a checkpoint ties them (no separate `output.weight`)
+instead of sharing the pointer — wasted memory and time on every
+tied-embedding model, not just the ones added this phase. Verified: rebuild,
+`--test` unchanged, and a real TinyLlama run produces byte-identical output
+to before this refactor (`arch=llama` auto-detected correctly, config
+values match, "hello" -> the same "Sure, I'd be happy to..." chat reply as
+before).
+
+**Qwen2.5-0.5B-Instruct**: downloaded (`Qwen/Qwen2.5-0.5B-Instruct-GGUF`,
+491MB). Config auto-detected exactly right (`dim=896 layers=24 heads=14
+kv_heads=2 head_dim=64 vocab=151936`) on the first try. Weight loading did
+not: **found a quantization format this file actually uses that the
+earlier research hadn't flagged** — `token_embd.weight` and several other
+big tensors are `Q5_0` (ggml type 6), not `Q4_K`/`Q6_K`/`Q8_0` as assumed
+from the "Q4_K_M" filename. Found by writing a five-line probe that dumps
+real tensor names/types from the file rather than guessing from the
+research summary. Implemented `Q5_0` dequantization (32-element blocks, a
+scale plus a 4-bytes-of-high-bits field folded into 4-bit nibbles for a
+5-bit signed value) from the public block format, verified by *it actually
+working* afterward, not by inspection alone. With that fixed: real output,
+first try, no further bugs. `hello` (raw, no chat template attempted for
+this architecture) continues as a Python function definition, then
+transitions into fluent, grammatically correct Chinese discussing Python's
+`__init__` method — a genuinely strong correctness signal, since getting
+multi-byte UTF-8 (Chinese characters) right end-to-end through byte-level
+BPE encode -> merge -> decode is a much sharper test than ASCII-only text
+would be. `--bench`: perplexity **10.84** over 35 tokens (ceiling ~151936
+for this file's larger vocab); all three fact completions correct,
+including "Two plus two equals" -> "four" (TinyLlama got this one wrong).

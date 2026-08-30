@@ -167,10 +167,14 @@ decoding are both deterministic).
   wrong output rather than an obvious failure) for a benefit not yet
   confirmed to be worth it here. See the `llamini-architecture` skill's
   "Still open" section for the concrete plan if this is picked up later.
-- **Dequantization supports F32, F16, Q4_0, Q4_1, Q8_0, Q4_K, Q6_K** (the
-  types an actual Q4_K_M file uses for norms/weights/output). Anything
-  else (`Q2_K`, `Q3_K`, `Q5_K`, `Q8_K`, ...) makes `gguf_dequantize_tensor`
-  return `-1` rather than silently misreading the bytes — see `gguf.c`.
+- **Dequantization supports F32, F16, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K**
+  (the types real "Q4_K_M"-labeled files actually use in practice for
+  norms/weights/output — a file's quantization-scheme *name* doesn't
+  guarantee every tensor uses only that scheme; Qwen2.5-0.5B's own
+  `Q4_K_M` file uses `Q5_0` for several tensors, found by inspecting real
+  tensor types rather than assuming). Anything else (`Q2_K`, `Q3_K`,
+  `Q5_K`, `Q8_K`, ...) makes `gguf_dequantize_tensor` return `-1` rather
+  than silently misreading the bytes — see `gguf.c`.
 - **The generic INT4 quantizer in `quant.c`** (scale/zero-point, exercised
   by `--test`) is a separate teaching implementation, unrelated to the
   real `Q4_K`/`Q6_K` GGUF block decoders in `gguf.c` used to actually load

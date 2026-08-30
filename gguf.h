@@ -30,6 +30,7 @@ typedef enum {
 #define GGML_TYPE_F16   1
 #define GGML_TYPE_Q4_0  2
 #define GGML_TYPE_Q4_1  3
+#define GGML_TYPE_Q5_0  6
 #define GGML_TYPE_Q8_0  8
 #define GGML_TYPE_Q4_K  12
 #define GGML_TYPE_Q5_K  13
@@ -95,6 +96,12 @@ int gguf_read_f32(GGUFFile* gf, u64 offset, f32* out, u64 elem_cnt);
 // defaults rather than treating a missing key as fatal.
 u32 gguf_get_u32(GGUFFile* gf, const char* key, u32 def_val);
 f32 gguf_get_f32(GGUFFile* gf, const char* key, f32 def_val);
+
+// Decodes a scalar STRING metadata value (e.g. "general.architecture")
+// into a freshly malloc'd null-terminated buffer -- caller frees. Returns
+// NULL if the key is missing or not a scalar string (an ARRAY of strings
+// is a different type; use gguf_get_string_array for that).
+char* gguf_get_str(GGUFFile* gf, const char* key);
 
 // Returns the number of elements in a metadata ARRAY value (0 if the key
 // is absent or not an array), and optionally its element type via

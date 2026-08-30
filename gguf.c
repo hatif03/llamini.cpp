@@ -257,6 +257,18 @@ f32 gguf_get_f32(GGUFFile* gf, const char* key, f32 def_val) {
     return def_val;
 }
 
+char* gguf_get_str(GGUFFile* gf, const char* key) {
+    const GGUFMeta* m = find_kv(gf, key);
+    if (!m || m->type != GGUF_TYPE_STRING) return NULL;
+    u64 len;
+    if (raw_read(gf, m->value_off, &len, 8) != 0 || len > GGUF_MAX_STR) return NULL;
+    char* s = (char*)malloc(len + 1);
+    if (!s) return NULL;
+    if (raw_read(gf, m->value_off + 8, s, len) != 0) { free(s); return NULL; }
+    s[len] = '\0';
+    return s;
+}
+
 u64 gguf_meta_array_len(GGUFFile* gf, const char* key, u32* elem_type_out) {
     const GGUFMeta* m = find_kv(gf, key);
     if (!m || m->type != GGUF_TYPE_ARRAY) return 0;
@@ -419,6 +431,32 @@ int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u
                 y[i + 16] = (f32)(qs[i] >> 4)  * d + m;
             }
             p += 20;
+        }
+        return 0;
+    }
+    case GGML_TYPE_Q5_0: {
+        if (n % 32 != 0) return -1;
+        u64 nb = n / 32;
+        if (abs_off > gf->size || nb * 22 > gf->size - abs_off) return -1;
+        const u8* p = (const u8*)gf->data + abs_off;
+        for (u64 b = 0; b < nb; b++) {
+            u16 dh; memcpy(&dh, p, 2);
+            f32 d = f16_to_f32(dh);
+            u32 qh; memcpy(&qh, p + 2, 4);
+            const u8* qs = p + 6;
+            f32* y = out + b * 32;
+            for (u32 i = 0; i < 16; i++) {
+                // The 5th (high) bit for element i lives at qh bit i, and
+                // for element i+16 at qh bit i+16 -- each folded into
+                // nibble bit 4 before combining with the low 4 bits.
+                u8 hi0 = (u8)(((qh >> i) << 4) & 0x10);
+                u8 hi1 = (u8)(((qh >> (i + 12))) & 0x10);
+                i32 x0 = (i32)((qs[i] & 0x0F) | hi0) - 16;
+                i32 x1 = (i32)((qs[i] >> 4)   | hi1) - 16;
+                y[i]      = (f32)x0 * d;
+                y[i + 16] = (f32)x1 * d;
+            }
+            p += 22;
         }
         return 0;
     }
