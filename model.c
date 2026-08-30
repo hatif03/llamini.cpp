@@ -58,9 +58,9 @@ void rope(f32* vec, u32 pos, u32 dim, u32 head_dim, f32 freq_base, RopeType type
 }
 
 #define MAX_THREADS    32
-#define LINEAR_PAR_MIN (1u << 20) // out_dim*in_dim below this: not worth spawning threads
+#define LINEAR_PAR_MIN (1u << 20) // out_dim*in_dim below this: not worth using the pool
 
-// Shared kernel for both the serial and threaded paths below -- exactly the
+// Shared kernel for both the serial and pooled paths below -- exactly the
 // original single-loop body, just over a caller-chosen row range, so there
 // is only one place this dot product is written.
 static void linear_range(f32* out, const f32* x, const f32* w, u32 in_dim, u32 o0, u32 o1) {
@@ -74,10 +74,58 @@ static void linear_range(f32* out, const f32* x, const f32* w, u32 in_dim, u32 o
 
 typedef struct { f32* out; const f32* x; const f32* w; u32 in_dim, o0, o1; } LinearJob;
 
-static void* linear_worker(void* arg) {
-    LinearJob* j = (LinearJob*)arg;
-    linear_range(j->out, j->x, j->w, j->in_dim, j->o0, j->o1);
+// Persistent worker pool -- replaces the old spawn-per-call pthread_create
+// (which ran ~9 times per layer per token). Workers are created once, block
+// on cond_start between dispatches, and the calling thread computes one
+// chunk itself instead of idling while it waits.
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_start;
+    pthread_cond_t cond_done;
+    pthread_t workers[MAX_THREADS];
+    LinearJob jobs[MAX_THREADS];
+    int worker_idx[MAX_THREADS]; // stable per-slot arg, avoids passing ints through void* casts
+    int n_workers;
+    int n_active;  // how many jobs[] slots are valid this round (workers beyond this re-wait)
+    int pending;   // countdown of active workers not yet done this round
+    int generation;
+    int started;
+} ThreadPool;
+
+static ThreadPool g_pool;
+
+static void* pool_worker(void* arg) {
+    int idx = *(int*)arg;
+    int my_gen = 0;
+    pthread_mutex_lock(&g_pool.mutex);
+    for (;;) {
+        while (g_pool.generation == my_gen) pthread_cond_wait(&g_pool.cond_start, &g_pool.mutex);
+        my_gen = g_pool.generation;
+        if (idx >= g_pool.n_active) continue; // no work dispatched to this slot this round
+        LinearJob job = g_pool.jobs[idx];
+        pthread_mutex_unlock(&g_pool.mutex);
+        linear_range(job.out, job.x, job.w, job.in_dim, job.o0, job.o1);
+        pthread_mutex_lock(&g_pool.mutex);
+        if (--g_pool.pending == 0) pthread_cond_signal(&g_pool.cond_done);
+    }
+    pthread_mutex_unlock(&g_pool.mutex);
     return NULL;
+}
+
+// ponytail: workers run until the process exits (never joined/torn down) --
+// this is a short-lived CLI, not a service, so the OS reclaiming them at
+// exit is simpler than adding shutdown plumbing nothing else needs.
+static void pool_ensure_started(int n_workers) {
+    if (g_pool.started) return;
+    pthread_mutex_init(&g_pool.mutex, NULL);
+    pthread_cond_init(&g_pool.cond_start, NULL);
+    pthread_cond_init(&g_pool.cond_done, NULL);
+    g_pool.n_workers = n_workers;
+    for (int i = 0; i < n_workers; i++) {
+        g_pool.worker_idx[i] = i;
+        pthread_create(&g_pool.workers[i], NULL, pool_worker, &g_pool.worker_idx[i]);
+    }
+    g_pool.started = 1;
 }
 
 // ponytail: cached after the first call, read only from the single
@@ -96,32 +144,39 @@ static int n_threads(void) {
 
 void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim) {
     int nt = n_threads();
-    // Small matmuls (k_proj/v_proj) do less work than spawning threads
-    // would cost -- stay serial. Every linear() call site's out/x buffers
-    // are distinct (verified in generate.c); this dispatcher assumes that.
+    // Small matmuls (k_proj/v_proj) do less work than dispatching to the
+    // pool would cost -- stay serial. Every linear() call site's out/x
+    // buffers are distinct (verified in generate.c); this dispatcher assumes that.
     if (nt < 2 || (u64)out_dim * in_dim < LINEAR_PAR_MIN || out_dim < (u32)nt) {
         linear_range(out, x, w, in_dim, 0, out_dim);
         return;
     }
 
-    pthread_t th[MAX_THREADS];
-    LinearJob jobs[MAX_THREADS];
+    pool_ensure_started(nt - 1);
+
     u32 chunk = (out_dim + (u32)nt - 1) / (u32)nt;
-    int spawned = 0;
-    for (int t = 0; t < nt; t++) {
-        u32 o0 = (u32)t * chunk;
+    u32 my_o1 = chunk > out_dim ? out_dim : chunk; // calling thread's own chunk: [0, my_o1)
+
+    pthread_mutex_lock(&g_pool.mutex);
+    int dispatched = 0;
+    for (int t = 0; t < g_pool.n_workers; t++) {
+        u32 o0 = (u32)(t + 1) * chunk;
         if (o0 >= out_dim) break;
         u32 o1 = o0 + chunk > out_dim ? out_dim : o0 + chunk;
-        jobs[t] = (LinearJob){ out, x, w, in_dim, o0, o1 };
-        if (pthread_create(&th[spawned], NULL, linear_worker, &jobs[t]) != 0) {
-            // Couldn't spawn this or any later worker -- finish every
-            // remaining row serially so no output row is ever left unwritten.
-            linear_range(out, x, w, in_dim, o0, out_dim);
-            break;
-        }
-        spawned++;
+        g_pool.jobs[t] = (LinearJob){ out, x, w, in_dim, o0, o1 };
+        dispatched++;
     }
-    for (int t = 0; t < spawned; t++) pthread_join(th[t], NULL);
+    g_pool.n_active = dispatched;
+    g_pool.pending = dispatched;
+    g_pool.generation++;
+    pthread_cond_broadcast(&g_pool.cond_start);
+    pthread_mutex_unlock(&g_pool.mutex);
+
+    linear_range(out, x, w, in_dim, 0, my_o1);
+
+    pthread_mutex_lock(&g_pool.mutex);
+    while (g_pool.pending > 0) pthread_cond_wait(&g_pool.cond_done, &g_pool.mutex);
+    pthread_mutex_unlock(&g_pool.mutex);
 }
 
 void causal_mha(const f32* q, const f32* k, const f32* v, KVCache* cache,

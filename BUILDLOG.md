@@ -448,3 +448,74 @@ cause. Not investigated further past this point, per the explicit decision
 going in: write the code, don't force a conclusive test this machine can't
 reliably give.
 model should show, not evidence of a bug.
+
+---
+
+## Phase 5 — CPU optimization pass (2026-08-30, ongoing)
+
+Asked to optimize for CPU-only inference (no GPU), grounded in real research
+rather than guessing, and to find an honest angle where this project could
+be measurably better than an existing tool on some specific metric.
+
+**Research first.** Fetched real ggml/llama.cpp source (`ggml-cpu/quants.c`,
+`ggml-cpu.c`, `llama-mmap.cpp`) directly via WebFetch rather than trusting
+AI-summarized search results (two early fetch attempts on this same pass
+returned lossy summaries and were discarded in favor of raw source). Found
+three concrete techniques: (1) `ggml_vec_dot_q4_0_q8_0` and friends never
+materialize a dequantized tensor — they unpack quantized blocks and do the
+dot product directly against packed bytes, converting to float only for the
+final scaled sum, because batch-1 CPU inference is memory-bandwidth bound,
+not compute bound (reading ~4.5 bits/weight instead of 32 costs ~7x less
+bandwidth); (2) a persistent thread pool (workers block on a condvar between
+graph evaluations, work-stealing via an atomic counter) instead of spawning
+per operation; (3) the whole GGUF file is mmap'd and read straight out of
+the page-cache-backed mapping, never eagerly copied. Separately surveyed the
+pure-CPU-LLM-runtime landscape: `llama2.c` (~700-2500 lines, one hardcoded
+architecture, custom format, no GGUF) is the only genuinely from-scratch
+comparator; `llamafile` vendors llama.cpp+ggml wholesale (~26MB, a real
+dependency by any honest reading); `bitnet.cpp` is a llama.cpp fork. This
+grounds llamini.cpp's honest claims: zero vendored ML source at all (vs.
+llamafile's real vendoring), and architecture-generality-per-line (4
+architectures auto-detected from GGUF metadata in ~2,900 lines, vs.
+llama2.c's 1 hardcoded architecture regardless of size).
+
+**Step 1: persistent thread pool.** `linear()` was calling `pthread_create`/
+`pthread_join` on every single call (~9 calls/layer x n_layers per token —
+198 spawns/token for TinyLlama's 22 layers). Replaced with a `ThreadPool`
+that creates `nt-1` workers once (mutex + two condvars + a generation
+counter so workers can tell a fresh dispatch from a spurious wakeup); the
+calling thread computes one chunk itself instead of idling while workers run
+the rest. Kept the exact same `linear_range` kernel and row-chunking math —
+this is a pure threading-overhead fix, not a numerical change.
+
+*A real correctness trap caught before committing*: with `n_active` workers
+dispatched but `n_workers` total slots existing, a naive "wake everyone"
+broadcast would let idle worker slots (index >= dispatched-this-round) read
+**stale job data from a previous dispatch** and write to the wrong buffer.
+Fixed by having each worker check `idx >= g_pool.n_active` and skip back to
+waiting instead of running a stale job — caught by re-reading the dispatch
+logic against a concrete example (`out_dim=4, nt=3` leaves one slot with no
+work) before ever running it, not by observing a corrupted-output bug.
+
+**Verification, and a real WSL crash mid-verification.** While A/B
+benchmarking a stashed pre-change baseline against the thread-pool build
+(TinyLlama, `--bench`), WSL's own service crashed
+(`Wsl/Service/E_UNEXPECTED` — `wsl --list` and even `echo alive` started
+failing) partway through the *baseline* run, not the new code. This is the
+same flavor of instability documented in Phase 4's Gemma-2b attempts. Asked
+before running `wsl --shutdown` (it ends any other WSL work in progress);
+user approved, WSL came back healthy (6.7GB free of 7.6GB) and the retry
+completed cleanly, so this reads as this dev VM's own instability under
+memory pressure, not a bug introduced by this change. Confirmed:
+- **Byte-identical output** (mod nondeterministic per-line tok/s timing
+  text) between the pre-change and post-change binaries for TinyLlama,
+  Qwen2.5-0.5B, and GPT-2-124M, all via `--bench`.
+- **TinyLlama wall-clock time dropped from 1:56.55 to 1:19.19** (`--bench`,
+  same machine, same file, `/usr/bin/time -v`) — a genuine ~32% reduction
+  from removing spawn-per-call overhead alone.
+- **Resident memory was unchanged** (~4.93GB both before and after) — expected,
+  since this step doesn't touch the eager-f32-dequant memory footprint;
+  that's the separate, larger change planned next.
+- `./llamini --test` unchanged (all existing assertions pass).
+
+Commit: `model: replace spawn-per-call threading with a persistent thread pool`
