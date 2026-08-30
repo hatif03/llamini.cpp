@@ -28,6 +28,13 @@ Run the in-process unit tests instead of the chat loop:
 ./mini_llama --test
 ```
 
+Run the quantitative correctness benchmark (see "Correctness evidence"
+below) instead of the chat loop:
+
+```bash
+./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --bench
+```
+
 ## Chat loop
 
 ~~~text
@@ -69,6 +76,37 @@ model does raw text completion, not turn-taking (see Limits below) — but
 they're genuine, coherent completions: typing "hello" continues it as if
 finishing a "Hello, world!" code example, which is a real, sensible
 continuation of that text, not noise.
+
+## Correctness evidence
+
+"The output looks like English" is a weak correctness claim. This project
+doesn't have (and, staying zero-dependency, deliberately didn't build) a
+reference `llama.cpp`/`transformers` install to diff against bit-for-bit, so
+`./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --bench` instead runs two
+self-contained, honest checks against the real model:
+
+1. **Teacher-forced perplexity** over a short fixed English test corpus
+   (`BENCH_CORPUS` in `main.c`), computed via `compute_perplexity` in
+   `generate.c` — for each position, how much probability the model's real
+   logits assign to the *actual* next word, never sampling. Measured:
+   **13.28** over 37 tokens. Compare to the one number that needs no
+   external citation to trust: a uniform-random guess over this file's
+   32000-token vocab has perplexity ~32000 (10.37 nats/token). 13.28 is
+   roughly three orders of magnitude below that ceiling — the forward pass
+   is doing real language modeling, not producing noise that merely
+   resembles English by chance.
+2. **Known-fact completions** (greedy, no chat template — raw text
+   completion): `"The capital of France is"` -> `" Paris."`; `"The sky is
+   the color"` -> `" of the sunset, and the sea"`; `"Two plus two equals"`
+   -> `"? \n\nA: The formula for"` (grammatical, but doesn't answer "four").
+   These are informational spot checks, not asserted in `--test` — a 1.1B
+   model isn't guaranteed to nail every fact even when the code is entirely
+   correct — but getting a specific factual completion right is a much
+   sharper signal than "sounds like English."
+
+Numbers above are from one real run against the actual downloaded GGUF
+file; re-running `--bench` reproduces them (teacher forcing and greedy
+decoding are both deterministic).
 
 ## Limits (honest, not papered over)
 

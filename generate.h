@@ -9,6 +9,15 @@
 // Pick the index with the largest logit.
 u32 greedy_sample(const f32* logits, u32 vocab_size);
 
+// Runs one token through the full forward pass at sequence position `pos`
+// (embedding lookup -> every decoder layer, RMSNorm -> GQA causal attention
+// with a per-layer KV cache -> residual -> RMSNorm -> SwiGLU FFN ->
+// residual -> final norm -> lm_head), writing model->cfg.vocab_size logits
+// into `logits_out`. Does not sample or track position bookkeeping --
+// shared by generate_autoregressive and compute_perplexity below, so there
+// is exactly one place this forward pass is written.
+void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32* logits_out);
+
 // Full autoregressive single-turn generation. First prefills every prompt
 // position through the full layer stack (RMSNorm -> GQA causal attention
 // with a per-layer KV cache -> residual -> RMSNorm -> SwiGLU FFN ->
@@ -22,5 +31,15 @@ u32 greedy_sample(const f32* logits, u32 vocab_size);
 u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
     u32* input_tokens, u32 in_token_count,
     u32* out_tokens, u32 max_gen_tokens, u32 eos_id);
+
+// Teacher-forced perplexity over tokens[0..n_tokens-1]: resets every
+// layer's KV cache, then for each position scores the probability
+// forward_step's logits assign to the *actual* next token in `tokens`
+// (never sampling), and returns exp(mean negative log-likelihood). A
+// broken/randomly-wired forward pass lands near a uniform-random ceiling
+// of ~vocab_size; a working language model should land dramatically lower
+// -- see main.c's --bench and README's "Correctness evidence". Returns
+// -1.0f if n_tokens is too short (< 2) to evaluate.
+f32 compute_perplexity(LLaMAModel* model, KVCache* caches, const u32* tokens, u32 n_tokens);
 
 #endif

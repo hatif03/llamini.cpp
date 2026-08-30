@@ -74,6 +74,61 @@ void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
     }
 }
 
+// A short, fixed, ordinary English test corpus -- no file I/O, no network,
+// no new dependency. Used for a self-contained quantitative correctness
+// check (see run_bench): teacher-forced perplexity against this text,
+// compared to the mathematically-certain "uniform random over the vocab"
+// ceiling, rather than an unverifiable external benchmark number.
+static const char* BENCH_CORPUS =
+    "The sun rises in the east and sets in the west every day. "
+    "Water is essential for all living things to survive. "
+    "Many people enjoy reading books during their free time.";
+
+static const char* BENCH_PROMPTS[] = {
+    "The capital of France is",
+    "Two plus two equals",
+    "The sky is the color",
+};
+#define BENCH_N_PROMPTS 3
+
+// Quantitative correctness check against the real model (see README's
+// "Correctness evidence" and STDLIB.md's Package Killer section): a
+// teacher-forced perplexity number compared to the random-baseline ceiling,
+// plus a few known-fact completions as an informational, human-readable
+// spot check (not asserted -- a small model isn't guaranteed to nail every
+// fact even when correctly implemented).
+void run_bench(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
+    printf("\n======== Correctness Benchmark ========\n");
+    printf("Test corpus: \"%s\"\n\n", BENCH_CORPUS);
+
+    u32 tokens[256];
+    u32 n = text_to_tokens(vocab, BENCH_CORPUS, tokens, 256);
+
+    f32 ppl = compute_perplexity(model, caches, tokens, n);
+    f32 ceiling = (f32)model->cfg.vocab_size;
+    printf("Teacher-forced perplexity over %u tokens: %.2f\n", n, ppl);
+    printf("Random-baseline ceiling (uniform over a %u-token vocab): ~%.0f (%.2f nats/token)\n",
+           model->cfg.vocab_size, ceiling, logf(ceiling));
+    printf("A broken/randomly-wired forward pass would land near that ceiling;\n"
+           "a working language model should land dramatically lower.\n");
+
+    printf("\n-- known-fact completions (greedy, raw prompt, informational not asserted) --\n");
+    for (u32 p = 0; p < BENCH_N_PROMPTS; p++) {
+        u32 in_tok[MAX_TURN_TOKENS];
+        u32 in_n = text_to_tokens(vocab, BENCH_PROMPTS[p], in_tok, MAX_TURN_TOKENS);
+        u32 out_tok[MAX_TURN_TOKENS + 8];
+
+        for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
+        u32 total = generate_autoregressive(model, caches, in_tok, in_n, out_tok, 8, vocab->eos_id);
+
+        printf("\"%s\" ->", BENCH_PROMPTS[p]);
+        char word[MAX_TOKEN_LEN];
+        for (u32 i = in_n; i < total; i++)
+            if (token_to_text(vocab, out_tok[i], word, sizeof(word)) > 0) printf("%s", word);
+        printf("\n");
+    }
+}
+
 // ==============================================
 // Main function: parse a real GGUF file end to end (metadata-driven
 // config, real weights, real vocab) and start chatting.
@@ -85,9 +140,11 @@ int main(int argc, char** argv) {
     }
 
     if (argc < 2) {
-        fprintf(stderr, "Usage:\n  %s model.gguf\n  %s --test\n", argv[0], argv[0]);
+        fprintf(stderr, "Usage:\n  %s model.gguf\n  %s model.gguf --bench\n  %s --test\n",
+                argv[0], argv[0], argv[0]);
         return 1;
     }
+    int bench_mode = (argc >= 3 && !strcmp(argv[2], "--bench"));
 
     GGUFFile gf;
     if (gguf_open(argv[1], &gf) != 0) {
@@ -124,7 +181,8 @@ int main(int argc, char** argv) {
     KVCache* caches = (KVCache*)calloc(cfg.n_layers, sizeof(KVCache));
     for (u32 l = 0; l < cfg.n_layers; l++) kv_cache_init(&caches[l], kv_dim, cfg.seq_len);
 
-    if (have_vocab) start_chat(&model, caches, &vocab);
+    if (have_vocab && bench_mode) run_bench(&model, caches, &vocab);
+    else if (have_vocab) start_chat(&model, caches, &vocab);
 
     for (u32 l = 0; l < cfg.n_layers; l++) { free(caches[l].key); free(caches[l].val); }
     free(caches);
