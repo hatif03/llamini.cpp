@@ -19,8 +19,9 @@ still can't do.
 | A logging framework | Plain `printf` / `fprintf(stderr, ...)` | No log levels, no formatting pipeline — stdout for normal output, stderr for warnings/errors, per Track A CLI conventions. |
 | A "safe string" / bounds-checked I/O library | Manual range checks throughout `gguf.c`'s cursor and `gguf_dequantize_tensor` before any `memcpy` out of the mmap'd region | A user-supplied `.gguf` is untrusted input; every read fails closed (`-1` / a sticky cursor error) instead of reading past the mapping on a short or malformed file. |
 | A dependency-injection/config framework for model hyperparameters | `llama_config_from_gguf` in `model.c`, reading `llama.embedding_length` / `llama.block_count` / `llama.attention.head_count(_kv)` / `llama.feed_forward_length` / `llama.context_length` / RoPE and RMSNorm constants straight out of the file's own metadata | The model's shape is whatever the GGUF file says it is; hardcoded TinyLlama-1.1B numbers are only the fallback defaults for a key the file doesn't define. |
+| A sampling/inference library's temperature+top-p logic | Hand-written `sample_token` in `generate.c`: numerically-stable softmax, `qsort` (libc) by probability, nucleus cutoff, then `rand()`/`srand()` (libc) to draw | `temp <= 0` dispatches straight to the pre-existing deterministic `greedy_sample`, so enabling this feature couldn't silently change the already-verified default behavior. |
 
 ## Deliberately not substituted (out of scope, disclosed instead of faked)
 
 - **A chat template.** TinyLlama-Chat's `<|system|>/<|user|>/<|assistant|>` prompt format isn't implemented — this project tokenizes your raw input line directly, so it's doing text completion, not chat. Not a stdlib gap; just unwritten. See README.
-- **Sampling.** Only greedy argmax decoding; no temperature/top-p/top-k. Again, not a package this project would have reached for either way.
+- **No top-k, repetition penalty, or `--seed`.** `--temp` sampling (see table above) covers temperature + top-p only; no reproducible-sampled-transcript flag yet.

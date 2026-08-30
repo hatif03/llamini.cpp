@@ -22,6 +22,13 @@ make
 ./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
+Chat is greedy (deterministic) by default. Pass `--temp X` (0 < X, e.g. 0.8)
+for temperature + top-p=0.9 nucleus sampling instead:
+
+```bash
+./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --temp 0.8
+```
+
 Run the in-process unit tests instead of the chat loop:
 
 ```bash
@@ -117,8 +124,11 @@ decoding are both deterministic).
   if it were the start of some other piece of text, rather than replying
   to you as a chatbot would. Wiring up the real chat template is the
   natural next step here.
-- **Greedy decoding only.** No temperature/top-p/top-k sampling, so output
-  is deterministic and can repeat or loop on longer generations.
+- **Greedy by default, temperature + top-p opt-in.** `--temp X` (`main.c`,
+  `sample_token` in `generate.c`) enables softmax sampling with nucleus
+  filtering; there's no top-k, no repetition penalty, and no `--seed` for a
+  reproducible sampled transcript yet. Without `--temp`, output stays fully
+  deterministic and can still repeat or loop on longer generations.
 - **Single-turn generation.** Each chat line resets every layer's KV cache
   and is generated independently; there is no multi-turn conversational
   memory.

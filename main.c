@@ -34,11 +34,12 @@ void run_all_unit_tests() {
 
 // ==============================================
 // Main chat loop: input -> real BPE tokenizer -> full transformer forward
-// pass -> greedy decode -> output. Each turn is single-turn generation:
-// every layer's KV cache is reset per turn rather than pretending to
-// carry multi-turn context (see generate.h).
+// pass -> decode -> output. Each turn is single-turn generation: every
+// layer's KV cache is reset per turn rather than pretending to carry
+// multi-turn context (see generate.h). `temp` <= 0 is the original
+// deterministic greedy decode; > 0 samples (see sample_token, generate.h).
 // ==============================================
-void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
+void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp) {
     char user_input[MAX_PROMPT_LEN];
     char word[MAX_TOKEN_LEN];
     u32 input_tokens[MAX_TURN_TOKENS];
@@ -63,7 +64,8 @@ void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
 
         for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
         u32 total = generate_autoregressive(model, caches, input_tokens, in_count,
-                                             out_tokens, MAX_GEN_TOKENS, vocab->eos_id);
+                                             out_tokens, MAX_GEN_TOKENS, vocab->eos_id,
+                                             temp, 0.9f);
 
         printf("Bot:");
         for (u32 i = in_count; i < total; i++) {
@@ -119,7 +121,10 @@ void run_bench(LLaMAModel* model, KVCache* caches, Vocab* vocab) {
         u32 out_tok[MAX_TURN_TOKENS + 8];
 
         for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
-        u32 total = generate_autoregressive(model, caches, in_tok, in_n, out_tok, 8, vocab->eos_id);
+        // Deterministic greedy (temp=0), not the chat loop's --temp, so
+        // --bench's evidence is reproducible run to run.
+        u32 total = generate_autoregressive(model, caches, in_tok, in_n, out_tok, 8,
+                                             vocab->eos_id, 0.0f, 0.0f);
 
         printf("\"%s\" ->", BENCH_PROMPTS[p]);
         char word[MAX_TOKEN_LEN];
@@ -140,11 +145,17 @@ int main(int argc, char** argv) {
     }
 
     if (argc < 2) {
-        fprintf(stderr, "Usage:\n  %s model.gguf\n  %s model.gguf --bench\n  %s --test\n",
+        fprintf(stderr, "Usage:\n  %s model.gguf [--temp X]\n  %s model.gguf --bench\n  %s --test\n",
                 argv[0], argv[0], argv[0]);
         return 1;
     }
-    int bench_mode = (argc >= 3 && !strcmp(argv[2], "--bench"));
+    int bench_mode = 0;
+    f32 temp = 0.0f;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--bench")) bench_mode = 1;
+        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = (f32)atof(argv[++i]);
+    }
+    if (temp > 0.0f) srand((unsigned)time(NULL));
 
     GGUFFile gf;
     if (gguf_open(argv[1], &gf) != 0) {
@@ -182,7 +193,7 @@ int main(int argc, char** argv) {
     for (u32 l = 0; l < cfg.n_layers; l++) kv_cache_init(&caches[l], kv_dim, cfg.seq_len);
 
     if (have_vocab && bench_mode) run_bench(&model, caches, &vocab);
-    else if (have_vocab) start_chat(&model, caches, &vocab);
+    else if (have_vocab) start_chat(&model, caches, &vocab, temp);
 
     for (u32 l = 0; l < cfg.n_layers; l++) { free(caches[l].key); free(caches[l].val); }
     free(caches);
@@ -269,7 +280,7 @@ void test_generate() {
 
     u32 in_tokens[4] = {1, 3, 4, 2};
     u32 out_tokens[4 + 4];
-    u32 total = generate_autoregressive(&model, &cache, in_tokens, 4, out_tokens, 4, 999);
+    u32 total = generate_autoregressive(&model, &cache, in_tokens, 4, out_tokens, 4, 999, 0.0f, 0.0f);
     assert(total >= 4 && total <= 8);
     for (u32 i = 0; i < total; i++) {
         assert(out_tokens[i] < cfg.vocab_size);

@@ -8,6 +8,57 @@ u32 greedy_sample(const f32* logits, u32 vocab_size) {
     return max_idx;
 }
 
+typedef struct { f32 p; u32 id; } PIdx;
+
+// Descending by probability -- qsort wants -1/0/1, not a bool.
+static int pidx_cmp(const void* a, const void* b) {
+    f32 pa = ((const PIdx*)a)->p, pb = ((const PIdx*)b)->p;
+    return (pa < pb) - (pa > pb);
+}
+
+// temp <= 0 dispatches straight to greedy_sample (bit-identical, so the
+// already-verified deterministic path never changes just because sampling
+// exists). Otherwise: numerically-stable softmax (subtract max before expf,
+// same pattern causal_mha/compute_perplexity already use), sort by
+// probability, keep the smallest nucleus whose mass reaches top_p, and draw
+// from it.
+u32 sample_token(const f32* logits, u32 vocab_size, f32 temp, f32 top_p) {
+    if (temp <= 0.0f) return greedy_sample(logits, vocab_size);
+
+    PIdx* c = (PIdx*)malloc((size_t)vocab_size * sizeof(PIdx));
+    if (!c) return greedy_sample(logits, vocab_size); // degrade, never crash
+
+    f32 mx = logits[0];
+    for (u32 i = 1; i < vocab_size; i++) if (logits[i] > mx) mx = logits[i];
+
+    f32 sum = 0.0f;
+    for (u32 i = 0; i < vocab_size; i++) {
+        f32 p = expf((logits[i] - mx) / temp);
+        c[i].p = p; c[i].id = i;
+        sum += p;
+    }
+    qsort(c, vocab_size, sizeof(PIdx), pidx_cmp);
+
+    f32 cum = 0.0f;
+    u32 keep = 0;
+    while (keep < vocab_size) {
+        cum += c[keep].p;
+        keep++;
+        if (cum >= top_p * sum) break;
+    }
+
+    f32 r = ((f32)rand() / ((f32)RAND_MAX + 1.0f)) * cum;
+    f32 acc = 0.0f;
+    u32 pick = c[0].id;
+    for (u32 i = 0; i < keep; i++) {
+        acc += c[i].p;
+        if (r < acc) { pick = c[i].id; break; }
+    }
+
+    free(c);
+    return pick;
+}
+
 void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32* logits_out) {
     u32 dim = model->cfg.dim;
     u32 ffn = model->cfg.ffn_dim;
@@ -62,7 +113,7 @@ void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32
 
 u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
     u32* input_tokens, u32 in_token_count,
-    u32* out_tokens, u32 max_gen_tokens, u32 eos_id)
+    u32* out_tokens, u32 max_gen_tokens, u32 eos_id, f32 temp, f32 top_p)
 {
     u32 total_tokens = in_token_count;
     memcpy(out_tokens, input_tokens, in_token_count * sizeof(u32));
@@ -90,7 +141,7 @@ u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
         pos++;
         if (pos < in_token_count) continue; // still prefilling: no sample, no append
 
-        u32 next_tok = greedy_sample(logits, model->cfg.vocab_size);
+        u32 next_tok = sample_token(logits, model->cfg.vocab_size, temp, top_p);
         out_tokens[total_tokens++] = next_tok;
         if (next_tok == eos_id) break;
         if (total_tokens - in_token_count >= max_gen_tokens) break;

@@ -9,6 +9,11 @@
 // Pick the index with the largest logit.
 u32 greedy_sample(const f32* logits, u32 vocab_size);
 
+// temp <= 0 dispatches to greedy_sample (bit-identical, deterministic).
+// Otherwise: softmax at temperature `temp`, nucleus-sampled from the
+// smallest set of tokens whose probability mass reaches `top_p`.
+u32 sample_token(const f32* logits, u32 vocab_size, f32 temp, f32 top_p);
+
 // Runs one token through the full forward pass at sequence position `pos`
 // (embedding lookup -> every decoder layer, RMSNorm -> GQA causal attention
 // with a per-layer KV cache -> residual -> RMSNorm -> SwiGLU FFN ->
@@ -28,9 +33,11 @@ void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32
 // layer (see kv_cache_init, called with n_heads_kv * head_dim as its "dim").
 // Cost scales with prompt length (a P-token prompt costs P forward passes
 // before the first generated token), not O(1) -- see README limits.
+// `temp`/`top_p` are forwarded to sample_token -- pass temp=0 for the
+// original deterministic greedy behavior.
 u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
     u32* input_tokens, u32 in_token_count,
-    u32* out_tokens, u32 max_gen_tokens, u32 eos_id);
+    u32* out_tokens, u32 max_gen_tokens, u32 eos_id, f32 temp, f32 top_p);
 
 // Teacher-forced perplexity over tokens[0..n_tokens-1]: resets every
 // layer's KV cache, then for each position scores the probability
