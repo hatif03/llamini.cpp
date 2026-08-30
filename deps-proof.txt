@@ -59,16 +59,28 @@ and by the output being recognizable English, not noise):
   Loaded GGUF v3 (201 tensors, 23 metadata entries)
   Config: dim=2048 layers=22 heads=32 kv_heads=4 ffn=5632 vocab=32000 seq_len=2048
   You: hello
+  Bot:Sure, I'd be happy to provide you with a friendly chatbot that always
+  responds concisely. Here's a sample response:
+
+  Hey, how are you doing today?
+
+  I'm doing
+
+  $ ./mini_llama tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --raw
+  You: hello
   Bot:, world!
   ...
   In this example, the `print` function is used to output the greeting
   message. The `print` function takes a string as an argument, which is
   then printed to the console.
 
-(Ran after fixing generate_autoregressive to actually prefill every prompt
-token through the KV cache -- an earlier version of this run, before that
-fix, only ever forwarded the prompt's last token and produced disconnected
-text ("Bot:. The event, DP, and"); see git history.)
+(First transcript uses the default chat template, added after fixing
+generate_autoregressive to actually prefill every prompt token through the
+KV cache -- an earlier version of this run, before that fix, only ever
+forwarded the prompt's last token and produced disconnected text
+("Bot:. The event, DP, and"); see git history. Second transcript is --raw,
+which bypasses the chat template and reproduces the original prefill-fix
+output exactly, confirming --raw is a true no-op relative to that baseline.)
 
 Confirms: real GGUF header/metadata/tensor-table parsing, real Q4_K/Q6_K
 dequantization (embedding and output-projection rows come back as small,

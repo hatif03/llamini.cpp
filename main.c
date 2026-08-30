@@ -32,14 +32,62 @@ void run_all_unit_tests() {
     printf("=========================\n");
 }
 
+// TinyLlama-1.1B-Chat-v1.0's own chat_template (Zephyr-style), per the
+// model's tokenizer_config.json on Hugging Face:
+//   <|system|>\n{system}</s>\n<|user|>\n{message}</s>\n<|assistant|>\n
+// `<|system|>`/`<|user|>`/`<|assistant|>` are NOT special vocab tokens for
+// this model (stock 32000-piece LLaMA vocab, no added tokens) -- confirmed
+// by tokenizing them: they BPE-split into ordinary sub-word pieces just
+// like any other text, so plain text_to_tokens handles them correctly.
+// `</s>` is different: it names the real EOS control token (id 2, type
+// CONTROL), but empirically does NOT BPE-merge back into that single token
+// when typed as literal text -- verified by tokenizing the literal string
+// and finding zero occurrences of eos_id in the output; every real
+// tokenizer's chat-template handling relies on a special-token pre-split
+// step this project's tokenizer doesn't implement (see STDLIB.md). So
+// build_chat_prompt_tokens inserts the real eos_id token programmatically
+// between segments instead of embedding "</s>" as text.
+#define SYSTEM_PROMPT "You are a friendly chatbot who always responds concisely."
+
+// text_to_tokens always prepends BOS (see tokenizer.c); only the very first
+// segment's BOS is kept, later segments' auto-BOS is dropped so there's
+// exactly one at the start of the whole prompt.
+static u32 append_segment(const Vocab* vocab, const char* text, int keep_bos,
+                           u32* out_tokens, u32 n, u32 max_tokens) {
+    u32 tmp[MAX_TURN_TOKENS];
+    u32 tn = text_to_tokens(vocab, text, tmp, MAX_TURN_TOKENS);
+    for (u32 i = keep_bos ? 0 : 1; i < tn && n < max_tokens; i++) out_tokens[n++] = tmp[i];
+    return n;
+}
+
+static u32 build_chat_prompt_tokens(const Vocab* vocab, const char* user_input,
+                                     u32* out_tokens, u32 max_tokens) {
+    char seg[MAX_PROMPT_LEN + 32];
+    u32 n = 0;
+
+    snprintf(seg, sizeof(seg), "<|system|>\n" SYSTEM_PROMPT);
+    n = append_segment(vocab, seg, 1, out_tokens, n, max_tokens);
+    if (n < max_tokens) out_tokens[n++] = vocab->eos_id;
+
+    snprintf(seg, sizeof(seg), "<|user|>\n%s", user_input);
+    n = append_segment(vocab, seg, 0, out_tokens, n, max_tokens);
+    if (n < max_tokens) out_tokens[n++] = vocab->eos_id;
+
+    n = append_segment(vocab, "<|assistant|>\n", 0, out_tokens, n, max_tokens); // generation prompt, no closing </s>
+    return n;
+}
+
 // ==============================================
-// Main chat loop: input -> real BPE tokenizer -> full transformer forward
-// pass -> decode -> output. Each turn is single-turn generation: every
-// layer's KV cache is reset per turn rather than pretending to carry
-// multi-turn context (see generate.h). `temp` <= 0 is the original
-// deterministic greedy decode; > 0 samples (see sample_token, generate.h).
+// Main chat loop: input -> chat template -> real BPE tokenizer -> full
+// transformer forward pass -> decode -> output. Each turn is single-turn
+// generation: every layer's KV cache is reset per turn rather than
+// pretending to carry multi-turn context (see generate.h). `temp` <= 0 is
+// the original deterministic greedy decode; > 0 samples (see sample_token,
+// generate.h). `raw_mode` skips the chat template (see build_chat_prompt_tokens
+// above), tokenizing your line directly -- useful as an A/B control, and as
+// a fallback if this file's template guess ever needs to be bypassed.
 // ==============================================
-void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp) {
+void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp, int raw_mode) {
     char user_input[MAX_PROMPT_LEN];
     char word[MAX_TOKEN_LEN];
     u32 input_tokens[MAX_TURN_TOKENS];
@@ -60,7 +108,9 @@ void start_chat(LLaMAModel* model, KVCache* caches, Vocab* vocab, f32 temp) {
             printf("Bot: Bye!\n"); break;
         }
 
-        u32 in_count = text_to_tokens(vocab, user_input, input_tokens, MAX_TURN_TOKENS);
+        u32 in_count = raw_mode
+            ? text_to_tokens(vocab, user_input, input_tokens, MAX_TURN_TOKENS)
+            : build_chat_prompt_tokens(vocab, user_input, input_tokens, MAX_TURN_TOKENS);
 
         for (u32 l = 0; l < model->cfg.n_layers; l++) kv_cache_reset(&caches[l]);
         u32 total = generate_autoregressive(model, caches, input_tokens, in_count,
@@ -145,14 +195,16 @@ int main(int argc, char** argv) {
     }
 
     if (argc < 2) {
-        fprintf(stderr, "Usage:\n  %s model.gguf [--temp X]\n  %s model.gguf --bench\n  %s --test\n",
+        fprintf(stderr, "Usage:\n  %s model.gguf [--temp X] [--raw]\n  %s model.gguf --bench\n  %s --test\n",
                 argv[0], argv[0], argv[0]);
         return 1;
     }
     int bench_mode = 0;
+    int raw_mode = 0;
     f32 temp = 0.0f;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--bench")) bench_mode = 1;
+        else if (!strcmp(argv[i], "--raw")) raw_mode = 1;
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = (f32)atof(argv[++i]);
     }
     if (temp > 0.0f) srand((unsigned)time(NULL));
@@ -193,7 +245,7 @@ int main(int argc, char** argv) {
     for (u32 l = 0; l < cfg.n_layers; l++) kv_cache_init(&caches[l], kv_dim, cfg.seq_len);
 
     if (have_vocab && bench_mode) run_bench(&model, caches, &vocab);
-    else if (have_vocab) start_chat(&model, caches, &vocab, temp);
+    else if (have_vocab) start_chat(&model, caches, &vocab, temp, raw_mode);
 
     for (u32 l = 0; l < cfg.n_layers; l++) { free(caches[l].key); free(caches[l].val); }
     free(caches);
