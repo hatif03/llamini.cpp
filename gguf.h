@@ -136,4 +136,14 @@ u64 gguf_tensor_count(const GGUFTensorInfo* info);
 // load this weight," never proceed with whatever `out` happened to hold.
 int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u64 out_count);
 
+// Dequantizes just rows [row0, row1) of a tensor logically shaped as rows
+// of `row_len` elements each (e.g. an (out_dim, in_dim) weight matrix) into
+// `out` (must hold (row1-row0)*row_len floats). Used for on-demand loading
+// of large weight matrices instead of materializing the whole tensor to f32
+// up front. Every real transformer row length is a multiple of every
+// supported format's block size (32 or 256 elements) -- returns -1 rather
+// than silently misaligning if that's ever not true, same failure contract
+// as gguf_dequantize_tensor.
+int gguf_dequantize_rows(GGUFFile* gf, const GGUFTensorInfo* info, u32 row0, u32 row1, u32 row_len, f32* out);
+
 #endif

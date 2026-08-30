@@ -540,3 +540,100 @@ either way; it's included because it's correct, free, and the same "no
 private copy of what could stay page-cache-backed" spirit as step 3.
 
 Commit: `gguf: add posix_fadvise/madvise hints for sequential-load then random-access reads`
+
+**Step 3: on-demand dequantization — the headline change.** Research (above)
+identified the real gap between this project and ggml: every weight tensor
+was fully dequantized to `f32` at load time and kept resident for the whole
+process, which is *why* Gemma-2b was undocumented as "untested" in Phase 4
+(its ~10-12GB f32 footprint didn't fit this ~7.6GB dev machine) and why
+TinyLlama's own resident memory sat at ~4.4-4.9GB for a 669MB file. This had
+already been scoped once before (Phase 2's stretch-goal analysis) and rated
+high risk; revisited now with a concrete, lower-risk decomposition:
+
+- `gguf.c`'s per-type dequant switch was refactored (mechanically, case by
+  case) from "always dequantize the whole tensor" into a shared
+  `dequantize_range(gf, info, elem0, elem1, out)` taking an arbitrary
+  block-aligned element range, with `gguf_dequantize_tensor` (whole tensor)
+  and a new `gguf_dequantize_rows` (a row range) as thin wrappers over it.
+  Verified block-alignment is guaranteed: every real transformer row length
+  (`dim`, `ffn_dim`) is a multiple of every format's block size (32 or 256),
+  so any row-multiple element offset is automatically block-aligned — the
+  refactor still asserts this per-call rather than assuming it.
+- `Tensor` (`tensor.h`) gained two nullable fields, `src_gf`/`src_info`. A
+  tensor is "lazy" iff `src_gf != NULL`; every existing `tensor_create`
+  caller (crucially including `main.c`'s `test_generate`, which pokes
+  synthetic floats directly into `->data` and never touches GGUF at all) is
+  completely unaffected, since those fields default NULL and `data` stays
+  eagerly calloc'd exactly as before. This is what made the refactor
+  materially lower-risk than the original stretch-goal analysis assumed —
+  no test-harness rewrite needed.
+- `model.c`'s `llama_load_weights` marks only the big matmul-weight tensors
+  lazy (embeddings, `lm_head`, every per-layer `q/k/v/o_proj` and
+  `gate/up/down_proj`) — norms and biases stay eager, too small to matter.
+  `linear()`'s signature changed from a raw `const f32*` to `const Tensor*`,
+  dispatching on `w->data` (eager, unchanged behavior, still pool-threaded)
+  vs. `w->src_gf` (lazy, new `linear_lazy()` path).
+- `linear_lazy()` dequantizes **fixed-size** row-chunks (`LAZY_CHUNK_ROWS =
+  256`), not thread-count-sized chunks. This was a real design correction
+  caught before writing any code, not after: the eager path's chunking
+  scheme (out_dim/nthreads rows per worker) would size each worker's
+  scratch buffer at up to ~250MB for Gemma's 256128-row embedding/`lm_head`
+  table — right back to a multi-hundred-MB transient buffer for the exact
+  tensor this change is meant to fix. A fixed row count keeps peak
+  transient memory bounded regardless of tensor width. This also meant
+  deciding *not* to dispatch the lazy path to the thread pool at all:
+  research found CPU batch-1 inference is memory-bandwidth bound, not
+  compute bound, so N threads racing for the same mmap'd bytes isn't an
+  obvious win, and it would reopen the same per-worker-buffer-size problem.
+  Documented as a `ponytail:`/STDLIB.md-disclosed simplification, not a
+  silently accepted gap: this is measurably simpler than ggml's real
+  integer-SIMD quantized dot product (which never produces a float until
+  the final scaled sum, and quantizes activations too), and revisiting it
+  is only worth doing if a real profile shows this loop is compute-bound
+  after all.
+
+**Verification — the acceptance bar was bit-identical output, not "doesn't
+crash."** Built a pre-change binary (`git stash` back to the previous
+commit) and the post-change binary side by side, then A/B'd every verified
+model:
+
+| Model | Output | Resident memory before -> after | Notes |
+| --- | --- | --- | --- |
+| TinyLlama-1.1B | byte-identical | ~4.65GB -> ~702MB (~6.6x) | wall-clock varied wildly run to run on this VM (19:49 vs 3:07 in one pairing) -- see caveat below |
+| Qwen2.5-0.5B | byte-identical | ~2.96GB -> ~477MB (~6.2x) | two independent runs each, RSS reproducible within ~1MB |
+| GPT-2-124M | byte-identical | ~831MB -> ~831MB (unchanged, expected) | GPT-2's own tensors were deliberately left eager this pass (`gpt2.c` scope, not touched) -- this run exists only to confirm `linear()`'s new `Tensor*` signature didn't silently break GPT-2's path |
+| Gemma-2b | n/a (previously never completed) | untestable -> ~1.54GB, twice, byte-identical across both runs | **the actual resolution of Phase 4's open item** |
+
+Gemma-2b specifically: given its history (three prior attempts, three
+different inconclusive outcomes), ran it *twice* rather than once before
+calling it fixed. Both runs completed cleanly, produced byte-identical
+output (perplexity 73.05 over the fixed test corpus, dramatically below its
+~256128-token-vocab ceiling; 2/3 known-fact completions correct), and
+reported near-identical RSS (1577496 vs 1577412 KB). This is the difference
+between "worked once" and "reliable" — the bar this pass's optimization was
+explicitly asked to hit.
+
+One honest caveat on timing: wall-clock numbers on this dev VM were too
+noisy to report a single confident speedup figure. The same TinyLlama
+`--bench` run measured 19:49 (baseline, high-memory-pressure run) against
+3:07 (lazy, low-memory run) in one pairing, but Qwen2.5 pairings showed
+smaller, less dramatic gaps (and even one run where the *lazy* binary was
+slower in wall-clock than a low-memory-pressure baseline run, though never
+in the same A/B pairing) — consistent with this VM's memory-ballooning
+overhead (documented since Phase 2) dominating over raw arithmetic cost.
+The resident-memory reduction, by contrast, was tight and reproducible
+across every pairing (~6-7x, every time) — that's the number reported in
+README/STDLIB, not a cherry-picked timing run.
+
+Hit one real WSL crash during this step too (`wsl: Failed to start the
+systemd user session for 'root'` on one `make` invocation, immediately
+after the earlier Phase 5 crash-and-restart) — retried once, succeeded
+cleanly. Read as this VM's general instability under today's workload
+(several large model loads back to back), not a defect in the change.
+
+Also hit, and fixed without needing a rebuild: `gguf.c`'s `posix_fadvise`/
+`posix_madvise` calls (step 2) needed `_POSIX_C_SOURCE` defined before any
+system header — already covered above, re-confirmed working here since this
+step rebuilds on top of it.
+
+Commit: `gguf+model+tensor: dequantize weight rows on demand instead of materializing f32 upfront`

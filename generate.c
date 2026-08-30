@@ -80,7 +80,7 @@ void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32
     f32* ffn_hid   = (f32*)malloc(ffn * sizeof(f32));
     f32* ffn_out   = (f32*)malloc(dim * sizeof(f32));
 
-    memcpy(hidden, model->embeddings->data + (u64)token_id * dim, dim * sizeof(f32));
+    tensor_get_row(model->embeddings, token_id, dim, hidden);
     if (model->cfg.embedding_scale != 1.0f)
         for (u32 d = 0; d < dim; d++) hidden[d] *= model->cfg.embedding_scale;
 
@@ -88,9 +88,9 @@ void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32
         DecoderLayer* layer = &model->layers[l];
 
         rms_norm(xnorm, hidden, layer->attn_norm->data, dim, model->cfg.rms_eps);
-        linear(q, xnorm, layer->q_proj->data, dim, q_dim);
-        linear(k, xnorm, layer->k_proj->data, dim, kv_dim);
-        linear(v, xnorm, layer->v_proj->data, dim, kv_dim);
+        linear(q, xnorm, layer->q_proj, dim, q_dim);
+        linear(k, xnorm, layer->k_proj, dim, kv_dim);
+        linear(v, xnorm, layer->v_proj, dim, kv_dim);
         if (model->cfg.qkv_bias) {
             add_bias(q, layer->q_bias->data, q_dim);
             add_bias(k, layer->k_bias->data, kv_dim);
@@ -101,19 +101,19 @@ void forward_step(LLaMAModel* model, KVCache* caches, u32 pos, u32 token_id, f32
         rope(k, pos, kv_dim, head_dim, model->cfg.rope_freq_base, model->cfg.rope_type);
 
         causal_mha(q, k, v, &caches[l], attn_out, pos, n_heads, n_heads_kv, head_dim);
-        linear(attn_proj, attn_out, layer->o_proj->data, q_dim, dim);
+        linear(attn_proj, attn_out, layer->o_proj, q_dim, dim);
         for (u32 d = 0; d < dim; d++) hidden[d] += attn_proj[d];
 
         rms_norm(xnorm, hidden, layer->ffn_norm->data, dim, model->cfg.rms_eps);
-        linear(gate, xnorm, layer->gate_proj->data, dim, ffn);
-        linear(up,   xnorm, layer->up_proj->data,   dim, ffn);
+        linear(gate, xnorm, layer->gate_proj, dim, ffn);
+        linear(up,   xnorm, layer->up_proj,   dim, ffn);
         ffn_glu(ffn_hid, gate, up, ffn, model->cfg.ffn_act);
-        linear(ffn_out, ffn_hid, layer->down_proj->data, ffn, dim);
+        linear(ffn_out, ffn_hid, layer->down_proj, ffn, dim);
         for (u32 d = 0; d < dim; d++) hidden[d] += ffn_out[d];
     }
 
     rms_norm(xnorm, hidden, model->final_norm->data, dim, model->cfg.rms_eps);
-    linear(logits_out, xnorm, model->lm_head->data, dim, model->cfg.vocab_size);
+    linear(logits_out, xnorm, model->lm_head, dim, model->cfg.vocab_size);
 
     free(hidden); free(xnorm); free(q); free(k); free(v);
     free(attn_out); free(attn_proj); free(gate); free(up); free(ffn_hid); free(ffn_out);

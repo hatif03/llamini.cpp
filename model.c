@@ -142,13 +142,48 @@ static int n_threads(void) {
     return n;
 }
 
-void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim) {
+#define LAZY_CHUNK_ROWS 256
+
+// ponytail: deliberately serial, not dispatched to the thread pool above.
+// Research (BUILDLOG Phase 5) found CPU batch=1 inference is memory-
+// bandwidth bound, not compute bound, so N threads all dequantizing from
+// the same mmap'd bytes at once isn't an obvious win. More importantly,
+// chunking by thread count (like the eager path above) would size each
+// worker's scratch buffer at out_dim/nthreads rows -- for a very wide
+// tensor (Gemma's 256128-row embedding/lm_head table) that's right back to
+// a multi-hundred-MB transient buffer, defeating the point for the exact
+// tensor this is meant to fix. A fixed row count keeps peak transient
+// memory bounded (LAZY_CHUNK_ROWS * in_dim floats) regardless of how wide
+// the matrix is. Revisit with per-worker scratch buffers if a real profile
+// ever shows this loop is compute-, not bandwidth-, bound.
+static void linear_lazy(f32* out, const f32* x, const Tensor* w, u32 in_dim, u32 out_dim) {
+    u32 chunk = LAZY_CHUNK_ROWS < out_dim ? LAZY_CHUNK_ROWS : out_dim;
+    f32* scratch = (f32*)malloc((u64)chunk * in_dim * sizeof(f32));
+    for (u32 o0 = 0; o0 < out_dim; o0 += chunk) {
+        u32 o1 = o0 + chunk > out_dim ? out_dim : o0 + chunk;
+        if (gguf_dequantize_rows(w->src_gf, w->src_info, o0, o1, in_dim, scratch) != 0) {
+            // A load-time bug or corrupt file reaching here shouldn't
+            // silently compute on garbage scratch memory -- zero these rows
+            // so it's visibly wrong output, not plausible-looking. This
+            // should never trip in practice: llama_load_weights already
+            // validated this tensor's existence/shape before marking it lazy.
+            for (u32 o = o0; o < o1; o++) out[o] = 0.0f;
+            continue;
+        }
+        linear_range(out + o0, x, scratch, in_dim, 0, o1 - o0);
+    }
+    free(scratch);
+}
+
+void linear(f32* out, const f32* x, const Tensor* w, u32 in_dim, u32 out_dim) {
+    if (!w->data) { linear_lazy(out, x, w, in_dim, out_dim); return; }
+
     int nt = n_threads();
     // Small matmuls (k_proj/v_proj) do less work than dispatching to the
     // pool would cost -- stay serial. Every linear() call site's out/x
     // buffers are distinct (verified in generate.c); this dispatcher assumes that.
     if (nt < 2 || (u64)out_dim * in_dim < LINEAR_PAR_MIN || out_dim < (u32)nt) {
-        linear_range(out, x, w, in_dim, 0, out_dim);
+        linear_range(out, x, w->data, in_dim, 0, out_dim);
         return;
     }
 
@@ -163,7 +198,7 @@ void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim) {
         u32 o0 = (u32)(t + 1) * chunk;
         if (o0 >= out_dim) break;
         u32 o1 = o0 + chunk > out_dim ? out_dim : o0 + chunk;
-        g_pool.jobs[t] = (LinearJob){ out, x, w, in_dim, o0, o1 };
+        g_pool.jobs[t] = (LinearJob){ out, x, w->data, in_dim, o0, o1 };
         dispatched++;
     }
     g_pool.n_active = dispatched;
@@ -172,7 +207,7 @@ void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim) {
     pthread_cond_broadcast(&g_pool.cond_start);
     pthread_mutex_unlock(&g_pool.mutex);
 
-    linear_range(out, x, w, in_dim, 0, my_o1);
+    linear_range(out, x, w->data, in_dim, 0, my_o1);
 
     pthread_mutex_lock(&g_pool.mutex);
     while (g_pool.pending > 0) pthread_cond_wait(&g_pool.cond_done, &g_pool.mutex);
@@ -375,14 +410,34 @@ void llama_model_free(LLaMAModel* model) {
 // Dequantizes the named tensor directly into `t`'s pre-allocated buffer.
 // Returns -1 (without touching `t`) if the tensor is missing, its element
 // count doesn't match, or its ggml_type isn't one this reader supports.
+// Used for norms and biases -- small enough that eager f32 costs nothing.
 static int load_tensor(GGUFFile* gf, const char* name, Tensor* t) {
     const GGUFTensorInfo* info = gguf_find_tensor(gf, name);
     if (!info) return -1;
     return gguf_dequantize_tensor(gf, info, t->data, t->size);
 }
 
+// Marks `t` lazy instead of dequantizing it now: validates the tensor
+// exists and its element count matches `t`'s declared shape (same failure
+// contract as load_tensor -- a missing/mismatched tensor is still a load
+// failure, never silently deferred), then frees `t`'s eagerly-calloc'd
+// buffer and points it at (gf, info) for linear()/tensor_get_row to
+// dequantize rows from on demand. Used for the big matmul-weight tensors
+// (embeddings, lm_head, every per-layer projection) where materializing
+// the whole thing to f32 up front is what multiplies this project's
+// memory footprint several times over the file's own quantized size.
+static int load_tensor_lazy(GGUFFile* gf, const char* name, Tensor* t) {
+    const GGUFTensorInfo* info = gguf_find_tensor(gf, name);
+    if (!info || gguf_tensor_count(info) != t->size) return -1;
+    free(t->data);
+    t->data = NULL;
+    t->src_gf = gf;
+    t->src_info = info;
+    return 0;
+}
+
 int llama_load_weights(LLaMAModel* model, GGUFFile* gf) {
-    if (load_tensor(gf, "token_embd.weight", model->embeddings) != 0) return -1;
+    if (load_tensor_lazy(gf, "token_embd.weight", model->embeddings) != 0) return -1;
     if (load_tensor(gf, "output_norm.weight", model->final_norm) != 0) return -1;
     // Some checkpoints (e.g. gemma) tie the output projection to the input
     // embeddings and don't ship output.weight at all -- share the
@@ -390,7 +445,7 @@ int llama_load_weights(LLaMAModel* model, GGUFFile* gf) {
     // second, wasted time into a separate buffer (llama_model_free checks
     // for this same-pointer case before freeing).
     if (gguf_find_tensor(gf, "output.weight")) {
-        if (load_tensor(gf, "output.weight", model->lm_head) != 0) return -1;
+        if (load_tensor_lazy(gf, "output.weight", model->lm_head) != 0) return -1;
     } else {
         tensor_free(model->lm_head);
         model->lm_head = model->embeddings;
@@ -402,11 +457,11 @@ int llama_load_weights(LLaMAModel* model, GGUFFile* gf) {
         snprintf(name, sizeof(name), "blk.%u.attn_norm.weight", l);
         if (load_tensor(gf, name, layer->attn_norm) != 0) return -1;
         snprintf(name, sizeof(name), "blk.%u.attn_q.weight", l);
-        if (load_tensor(gf, name, layer->q_proj) != 0) return -1;
+        if (load_tensor_lazy(gf, name, layer->q_proj) != 0) return -1;
         snprintf(name, sizeof(name), "blk.%u.attn_k.weight", l);
-        if (load_tensor(gf, name, layer->k_proj) != 0) return -1;
+        if (load_tensor_lazy(gf, name, layer->k_proj) != 0) return -1;
         snprintf(name, sizeof(name), "blk.%u.attn_v.weight", l);
-        if (load_tensor(gf, name, layer->v_proj) != 0) return -1;
+        if (load_tensor_lazy(gf, name, layer->v_proj) != 0) return -1;
         if (model->cfg.qkv_bias) {
             snprintf(name, sizeof(name), "blk.%u.attn_q.bias", l);
             if (load_tensor(gf, name, layer->q_bias) != 0) return -1;
@@ -416,15 +471,15 @@ int llama_load_weights(LLaMAModel* model, GGUFFile* gf) {
             if (load_tensor(gf, name, layer->v_bias) != 0) return -1;
         }
         snprintf(name, sizeof(name), "blk.%u.attn_output.weight", l);
-        if (load_tensor(gf, name, layer->o_proj) != 0) return -1;
+        if (load_tensor_lazy(gf, name, layer->o_proj) != 0) return -1;
         snprintf(name, sizeof(name), "blk.%u.ffn_norm.weight", l);
         if (load_tensor(gf, name, layer->ffn_norm) != 0) return -1;
         snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", l);
-        if (load_tensor(gf, name, layer->gate_proj) != 0) return -1;
+        if (load_tensor_lazy(gf, name, layer->gate_proj) != 0) return -1;
         snprintf(name, sizeof(name), "blk.%u.ffn_up.weight", l);
-        if (load_tensor(gf, name, layer->up_proj) != 0) return -1;
+        if (load_tensor_lazy(gf, name, layer->up_proj) != 0) return -1;
         snprintf(name, sizeof(name), "blk.%u.ffn_down.weight", l);
-        if (load_tensor(gf, name, layer->down_proj) != 0) return -1;
+        if (load_tensor_lazy(gf, name, layer->down_proj) != 0) return -1;
     }
     return 0;
 }

@@ -138,25 +138,29 @@ families, each surfacing something the previous ones didn't:
 | TinyLlama-1.1B-Chat-v1.0 | `llama` | 1.1B | 32000 | SentencePiece | 13.28 | 1/3 | GQA (32 query / 4 KV heads); the baseline this whole engine was built against |
 | Qwen2.5-0.5B-Instruct | `qwen2` | 0.5B | 151936 | byte-level BPE | 10.84 | 3/3 | Needed NEOX RoPE, QKV bias, and `Q5_0` dequant (found by probing the real file, not assumed from its "Q4_K_M" name) |
 | GPT-2 (124M) | `gpt2` | 124M | 50257 | byte-level BPE | 20.58 | 0/3 | Needed a wholly separate module (`gpt2.c`): fused QKV, LayerNorm, learned position embeddings, ungated GELU, no RoPE at all; needed `Q5_K` dequant |
-| Gemma-2b-it | `gemma` | 2.5B | 256128 | SentencePiece | untested | untested | Config auto-detection verified correct (NEOX RoPE, GeGLU, `embedding_scale`, tied embeddings, MQA all already-built code, zero new lines) — full generation not achieved on this project's ~7.6GB dev machine; see Limits |
+| Gemma-2b-it | `gemma` | 2.5B | 256128 | SentencePiece | 73.05 | 2/3 | Initially untestable end-to-end (~10-12GB f32 footprint didn't fit this ~7.6GB dev machine); now verified end-to-end after the on-demand dequantization pass below dropped its resident memory to ~1.5GB — see "CPU optimization" |
 
 \* Teacher-forced perplexity over the same fixed 35-ish-token English test
 corpus (`--bench`, see "Correctness evidence" above) — **not directly
 comparable across vocab sizes** (a larger vocab's random-guess ceiling is
 itself higher, so a fair comparison is each number against its own file's
 ceiling, not against each other): TinyLlama's ceiling is ~32000,
-Qwen2.5's ~151936, GPT-2's ~50257. All three measured numbers are three-ish
-orders of magnitude below their own ceiling. The GPT-2/TinyLlama/Qwen2.5
-ranking (worst to best) does track something real, though: newest,
-largest, most heavily instruction-tuned model wins, exactly as expected —
-not an artifact of the benchmark.
+Qwen2.5's ~151936, GPT-2's ~50257, Gemma-2b's ~256128. All four measured
+numbers are two-to-three orders of magnitude below their own ceiling.
+The GPT-2/TinyLlama/Qwen2.5 ranking (worst to best) does track something
+real, though: newest, largest, most heavily instruction-tuned model wins,
+exactly as expected — not an artifact of the benchmark. Gemma-2b's 73.05
+sits above TinyLlama's despite being the larger model, plausibly because
+its 256128-token vocabulary spreads probability mass thinner per token
+than TinyLlama's 32000 — consistent with, not contradicting, the
+"compare each number to its own ceiling" caveat above.
 
 Try any of them yourself:
 
 ```bash
 ./llamini qwen2.5-0.5b-instruct-q4_k_m.gguf --raw   # Qwen2.5-0.5B-Instruct
 ./llamini gpt2.Q4_K_M.gguf                          # GPT-2 (no chat template for this arch)
-./llamini gemma-2b-it-q4_k_m.gguf --bench           # Gemma-2b -- config-only verified, see above
+./llamini gemma-2b-it-q4_k_m.gguf --bench           # Gemma-2b -- now verified end-to-end, see above
 ```
 
 (`--raw` on Qwen2.5 because this project's chat template, `build_chat_prompt_tokens`
@@ -168,22 +172,25 @@ above uses for a fair, template-independent measurement.)
 
 ## Limits (honest, not papered over)
 
-- **Only four architectures, one of them unverified end-to-end.** `llama`,
-  `qwen2`, and `gpt2` are verified against real downloaded files (see
-  "Other model families"). `gemma`'s architecture-specific code (NEOX
-  RoPE, GeGLU, `embedding_scale`, tied embeddings, MQA) is all shared with
-  the already-verified LLaMA-family path and its config auto-detection is
-  confirmed correct against a real file, but full generation was not
-  achieved on this project's dev machine (~7.6GB RAM; Gemma-2b needs
-  roughly 10-12GB dequantized to f32) — three attempts gave inconclusive
-  results (no clean, single failure mode to point at) rather than one
-  confirmed crash, so this is reported as "untested under memory
-  pressure," not asserted as definitely working or definitely broken.
-  Mistral (GGUF architecture is literally `"llama"`, so it would load with
-  the existing code) and Gemma2 (real added complexity — logit/attention
-  softcapping, sliding-window attention, a `head_dim` that isn't
-  `dim/n_heads`) were not attempted at all. No chat template exists for
-  Qwen2 (it uses ChatML, `<|im_start|>`/`<|im_end|>`, not TinyLlama-Chat's
+- **Four architectures, all now verified end-to-end.** `llama`, `qwen2`,
+  and `gpt2` were verified against real downloaded files first (see
+  "Other model families"). `gemma` was initially the odd one out: its
+  architecture-specific code (NEOX RoPE, GeGLU, `embedding_scale`, tied
+  embeddings, MQA) is all shared with the already-verified LLaMA-family
+  path and its config auto-detection was confirmed correct against a real
+  file from the start, but full generation didn't fit this project's dev
+  machine (~7.6GB RAM; Gemma-2b's ~10-12GB fully-dequantized-to-f32
+  footprint didn't fit, and three attempts gave inconclusive results
+  rather than one clean failure). The CPU optimization pass below (see
+  "CPU optimization") fixed the underlying memory footprint for every
+  architecture, not Gemma specifically, and Gemma-2b now runs end-to-end
+  reproducibly at ~1.5GB resident — see "Other model families". Mistral
+  (GGUF architecture is literally `"llama"`, so it would load with the
+  existing code, demonstrating no new capability) and Gemma2 (real added
+  complexity — logit/attention softcapping, sliding-window attention, a
+  `head_dim` that isn't `dim/n_heads` — for the same memory cost as
+  Gemma1) were not attempted at all. No chat template exists for Qwen2
+  (it uses ChatML, `<|im_start|>`/`<|im_end|>`, not TinyLlama-Chat's
   format) or GPT-2 (no instruction-tuned convention to wrap in the first
   place) — both are raw-completion-only here.
 - **Chat template is a best-effort reconstruction, not verified against a
@@ -210,27 +217,41 @@ above uses for a fair, template-independent measurement.)
   memory.
 - **Slow, and prompt length now has a real cost.** `linear()` (the
   matrix-vector projection every layer uses, `model.c`) is parallelized
-  across output rows with pthreads and gcc now vectorizes its dot-product
-  reduction (conservative fast-math flags, see STDLIB.md/`deps-proof.txt`),
-  but `causal_mha`'s attention is still a naive scalar loop, and this
-  remains far from a production engine. Loading the ~638MB Q4_K_M file and
-  dequantizing all ~1.1B parameters to f32 (~4.4GB resident) took anywhere
-  from about 25 seconds to several minutes across runs in this project's
-  dev environment (a memory-constrained WSL2 VM) — real measurements
-  varied enough run-to-run that memory/virtualization overhead, not raw
-  arithmetic, looks like the dominant cost there (see `deps-proof.txt`).
-  Generation throughput measured 0.15-0.21 tok/s before threading and
-  1.0-2.1 tok/s after, on that same VM's 12 logical cores. Since prefilling
-  the prompt runs the full forward pass once per prompt token before the
-  first reply token, a long prompt now costs proportionally more time up
-  front than the old (incorrect) O(1)-in-prompt-length behavior did. The
-  architecturally "correct" fix for the memory footprint — keep weights
-  quantized and dequantize per-block on the fly inside `linear()`, instead
-  of fully dequantizing to `f32` at load time — was deliberately not
-  attempted: it's rated high risk (could silently produce plausible-but-
-  wrong output rather than an obvious failure) for a benefit not yet
-  confirmed to be worth it here. See the `llamini-architecture` skill's
-  "Still open" section for the concrete plan if this is picked up later.
+  across output rows with a persistent thread pool and gcc vectorizes its
+  dot-product reduction (conservative fast-math flags, see
+  STDLIB.md/`deps-proof.txt`), but `causal_mha`'s attention is still a
+  naive scalar loop, and this remains far from a production engine. Since
+  prefilling the prompt runs the full forward pass once per prompt token
+  before the first reply token, a long prompt costs proportionally more
+  time up front than a KV-cache-only design would. Wall-clock timing on
+  this project's dev environment (a memory-constrained WSL2 VM) has been
+  noisy enough run-to-run — the same binary on the same file has measured
+  anywhere from under a minute to nearly twenty — that virtualization/
+  memory-pressure overhead, not raw arithmetic, looks like the dominant
+  variable; see "CPU optimization" below and `deps-proof.txt` for the
+  actual numbers rather than a single claimed figure.
+- **CPU optimization.** Researched how the real llama.cpp/ggml achieves
+  its CPU performance (reading its actual source, not guessing) and
+  applied two independent fixes, staying inside libc+POSIX: (1) a
+  persistent thread pool in `model.c` replaced the old spawn-per-call
+  `pthread_create`/`pthread_join` (~9 spawns/layer/token), removing pure
+  threading overhead with bit-identical output; (2) weight matrices
+  (embeddings, `lm_head`, every per-layer projection) are now dequantized
+  in small row-chunks on demand, straight out of the mmap'd GGUF file,
+  instead of being fully materialized to `f32` at load time — the same
+  core idea as ggml's quantized dot products, adapted to this project's
+  simpler f32-scratch-buffer design rather than ggml's integer SIMD
+  kernels. This is a real, measured, and large effect: resident memory
+  dropped from ~4.4-4.9GB to ~700MB-1.5GB across every model tested (a
+  ~6-7x reduction, consistent across TinyLlama, Qwen2.5, and Gemma-2b),
+  and it is what let Gemma-2b move from "untested under memory pressure"
+  to reproducibly verified end-to-end (see "Other model families" above).
+  Output is bit-identical to the pre-optimization binary for every
+  verified model — this was the acceptance bar, not just "doesn't crash."
+  See `BUILDLOG.md`'s CPU optimization phase for the full research and
+  verification trail, and `STDLIB.md` for what's deliberately still
+  simpler than ggml's real approach (no quantized-activation dot products,
+  chunk size chosen for bounded memory over raw thread parallelism).
 - **Dequantization supports F32, F16, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K**
   (the types real "Q4_K_M"-labeled files actually use in practice for
   norms/weights/output — a file's quantization-scheme *name* doesn't

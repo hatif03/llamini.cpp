@@ -398,32 +398,42 @@ static void get_scale_min_k4(u32 j, const u8* q, u8* d_out, u8* m_out) {
     }
 }
 
-int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u64 out_count) {
+// Dequantizes the half-open element range [elem0, elem1) of the tensor's
+// flattened data into out[0 .. elem1-elem0). Every supported format's block
+// size (1 for F32/F16, 32 for Q4_0/Q4_1/Q5_0/Q8_0, 256 for the K-quants)
+// evenly divides every real transformer row length (dim/ffn_dim), so a
+// caller passing elem0/elem1 as row-multiples is always block-aligned --
+// checked below (`elem0 % blocksize`), never just assumed. The whole-tensor
+// entry point below is the special case elem0=0, elem1=n; the row-range
+// entry point used by lazy weight loading is the general case.
+static int dequantize_range(GGUFFile* gf, const GGUFTensorInfo* info, u64 elem0, u64 elem1, f32* out) {
     u64 n = gguf_tensor_count(info);
-    if (n != out_count) return -1;
+    if (elem1 > n || elem0 > elem1) return -1;
     u64 abs_off = gf->tensor_offset + info->offset;
     if (abs_off < info->offset) return -1; // overflow guard
+    u64 ne = elem1 - elem0;
 
     switch (info->ggml_type) {
     case GGML_TYPE_F32: {
-        return raw_read(gf, abs_off, out, n * sizeof(f32));
+        if (abs_off > gf->size || elem1 * sizeof(f32) > gf->size - abs_off) return -1;
+        return raw_read(gf, abs_off + elem0 * sizeof(f32), out, ne * sizeof(f32));
     }
     case GGML_TYPE_F16: {
-        if (abs_off > gf->size || n * 2 > gf->size - abs_off) return -1;
-        const u16* src = (const u16*)((const u8*)gf->data + abs_off);
-        for (u64 i = 0; i < n; i++) out[i] = f16_to_f32(src[i]);
+        if (abs_off > gf->size || elem1 * 2 > gf->size - abs_off) return -1;
+        const u16* src = (const u16*)((const u8*)gf->data + abs_off) + elem0;
+        for (u64 i = 0; i < ne; i++) out[i] = f16_to_f32(src[i]);
         return 0;
     }
     case GGML_TYPE_Q4_0: {
-        if (n % 32 != 0) return -1;
-        u64 nb = n / 32;
+        if (elem0 % 32 != 0 || elem1 % 32 != 0 || n % 32 != 0) return -1;
+        u64 nb = n / 32, b0 = elem0 / 32, b1 = elem1 / 32;
         if (abs_off > gf->size || nb * 18 > gf->size - abs_off) return -1;
-        const u8* p = (const u8*)gf->data + abs_off;
-        for (u64 b = 0; b < nb; b++) {
+        const u8* p = (const u8*)gf->data + abs_off + b0 * 18;
+        for (u64 b = b0; b < b1; b++) {
             u16 dh; memcpy(&dh, p, 2);
             f32 d = f16_to_f32(dh);
             const u8* qs = p + 2;
-            f32* y = out + b * 32;
+            f32* y = out + (b - b0) * 32;
             for (u32 i = 0; i < 16; i++) {
                 y[i]      = ((f32)(qs[i] & 0xF) - 8.0f) * d;
                 y[i + 16] = ((f32)(qs[i] >> 4)  - 8.0f) * d;
@@ -433,15 +443,15 @@ int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u
         return 0;
     }
     case GGML_TYPE_Q4_1: {
-        if (n % 32 != 0) return -1;
-        u64 nb = n / 32;
+        if (elem0 % 32 != 0 || elem1 % 32 != 0 || n % 32 != 0) return -1;
+        u64 nb = n / 32, b0 = elem0 / 32, b1 = elem1 / 32;
         if (abs_off > gf->size || nb * 20 > gf->size - abs_off) return -1;
-        const u8* p = (const u8*)gf->data + abs_off;
-        for (u64 b = 0; b < nb; b++) {
+        const u8* p = (const u8*)gf->data + abs_off + b0 * 20;
+        for (u64 b = b0; b < b1; b++) {
             u16 dh, mh; memcpy(&dh, p, 2); memcpy(&mh, p + 2, 2);
             f32 d = f16_to_f32(dh), m = f16_to_f32(mh);
             const u8* qs = p + 4;
-            f32* y = out + b * 32;
+            f32* y = out + (b - b0) * 32;
             for (u32 i = 0; i < 16; i++) {
                 y[i]      = (f32)(qs[i] & 0xF) * d + m;
                 y[i + 16] = (f32)(qs[i] >> 4)  * d + m;
@@ -451,16 +461,16 @@ int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u
         return 0;
     }
     case GGML_TYPE_Q5_0: {
-        if (n % 32 != 0) return -1;
-        u64 nb = n / 32;
+        if (elem0 % 32 != 0 || elem1 % 32 != 0 || n % 32 != 0) return -1;
+        u64 nb = n / 32, b0 = elem0 / 32, b1 = elem1 / 32;
         if (abs_off > gf->size || nb * 22 > gf->size - abs_off) return -1;
-        const u8* p = (const u8*)gf->data + abs_off;
-        for (u64 b = 0; b < nb; b++) {
+        const u8* p = (const u8*)gf->data + abs_off + b0 * 22;
+        for (u64 b = b0; b < b1; b++) {
             u16 dh; memcpy(&dh, p, 2);
             f32 d = f16_to_f32(dh);
             u32 qh; memcpy(&qh, p + 2, 4);
             const u8* qs = p + 6;
-            f32* y = out + b * 32;
+            f32* y = out + (b - b0) * 32;
             for (u32 i = 0; i < 16; i++) {
                 // The 5th (high) bit for element i lives at qh bit i, and
                 // for element i+16 at qh bit i+16 -- each folded into
@@ -477,31 +487,31 @@ int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u
         return 0;
     }
     case GGML_TYPE_Q8_0: {
-        if (n % 32 != 0) return -1;
-        u64 nb = n / 32;
+        if (elem0 % 32 != 0 || elem1 % 32 != 0 || n % 32 != 0) return -1;
+        u64 nb = n / 32, b0 = elem0 / 32, b1 = elem1 / 32;
         if (abs_off > gf->size || nb * 34 > gf->size - abs_off) return -1;
-        const u8* p = (const u8*)gf->data + abs_off;
-        for (u64 b = 0; b < nb; b++) {
+        const u8* p = (const u8*)gf->data + abs_off + b0 * 34;
+        for (u64 b = b0; b < b1; b++) {
             u16 dh; memcpy(&dh, p, 2);
             f32 d = f16_to_f32(dh);
             const i8* qs = (const i8*)(p + 2);
-            f32* y = out + b * 32;
+            f32* y = out + (b - b0) * 32;
             for (u32 i = 0; i < 32; i++) y[i] = (f32)qs[i] * d;
             p += 34;
         }
         return 0;
     }
     case GGML_TYPE_Q4_K: {
-        if (n % 256 != 0) return -1;
-        u64 nb = n / 256;
+        if (elem0 % 256 != 0 || elem1 % 256 != 0 || n % 256 != 0) return -1;
+        u64 nb = n / 256, b0 = elem0 / 256, b1 = elem1 / 256;
         if (abs_off > gf->size || nb * 144 > gf->size - abs_off) return -1;
-        const u8* p = (const u8*)gf->data + abs_off;
-        for (u64 b = 0; b < nb; b++) {
+        const u8* p = (const u8*)gf->data + abs_off + b0 * 144;
+        for (u64 b = b0; b < b1; b++) {
             u16 dh, dminh; memcpy(&dh, p, 2); memcpy(&dminh, p + 2, 2);
             f32 d = f16_to_f32(dh), dmin = f16_to_f32(dminh);
             const u8* scales = p + 4;
             const u8* q = p + 16;
-            f32* y = out + b * 256;
+            f32* y = out + (b - b0) * 256;
             u32 is = 0;
             for (u32 j = 0; j < 256; j += 64) {
                 u8 sc1, m1, sc2, m2;
@@ -518,17 +528,17 @@ int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u
         return 0;
     }
     case GGML_TYPE_Q5_K: {
-        if (n % 256 != 0) return -1;
-        u64 nb = n / 256;
+        if (elem0 % 256 != 0 || elem1 % 256 != 0 || n % 256 != 0) return -1;
+        u64 nb = n / 256, b0 = elem0 / 256, b1 = elem1 / 256;
         if (abs_off > gf->size || nb * 176 > gf->size - abs_off) return -1;
-        const u8* p = (const u8*)gf->data + abs_off;
-        for (u64 b = 0; b < nb; b++) {
+        const u8* p = (const u8*)gf->data + abs_off + b0 * 176;
+        for (u64 b = b0; b < b1; b++) {
             u16 dh, dminh; memcpy(&dh, p, 2); memcpy(&dminh, p + 2, 2);
             f32 d = f16_to_f32(dh), dmin = f16_to_f32(dminh);
             const u8* scales = p + 4;
             const u8* qh = p + 16;
             const u8* ql = p + 48;
-            f32* y = out + b * 256;
+            f32* y = out + (b - b0) * 256;
             u32 is = 0;
             u8 u1 = 1, u2 = 2;
             for (u32 j = 0; j < 256; j += 64) {
@@ -549,17 +559,17 @@ int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u
         return 0;
     }
     case GGML_TYPE_Q6_K: {
-        if (n % 256 != 0) return -1;
-        u64 nb = n / 256;
+        if (elem0 % 256 != 0 || elem1 % 256 != 0 || n % 256 != 0) return -1;
+        u64 nb = n / 256, b0 = elem0 / 256, b1 = elem1 / 256;
         if (abs_off > gf->size || nb * 210 > gf->size - abs_off) return -1;
-        const u8* p = (const u8*)gf->data + abs_off;
-        for (u64 b = 0; b < nb; b++) {
+        const u8* p = (const u8*)gf->data + abs_off + b0 * 210;
+        for (u64 b = b0; b < b1; b++) {
             const u8* ql = p;
             const u8* qh = p + 128;
             const i8* sc = (const i8*)(p + 192);
             u16 dh; memcpy(&dh, p + 208, 2);
             f32 d = f16_to_f32(dh);
-            f32* y = out + b * 256;
+            f32* y = out + (b - b0) * 256;
             for (u32 blk = 0; blk < 256; blk += 128) {
                 for (u32 l = 0; l < 32; l++) {
                     u32 is = l / 16;
@@ -581,4 +591,15 @@ int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u
     default:
         return -1; // unsupported ggml_type
     }
+}
+
+int gguf_dequantize_tensor(GGUFFile* gf, const GGUFTensorInfo* info, f32* out, u64 out_count) {
+    u64 n = gguf_tensor_count(info);
+    if (n != out_count) return -1;
+    return dequantize_range(gf, info, 0, n, out);
+}
+
+int gguf_dequantize_rows(GGUFFile* gf, const GGUFTensorInfo* info, u32 row0, u32 row1, u32 row_len, f32* out) {
+    if (row1 < row0) return -1;
+    return dequantize_range(gf, info, (u64)row0 * row_len, (u64)row1 * row_len, out);
 }

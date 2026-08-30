@@ -86,8 +86,12 @@ void rope(f32* vec, u32 pos, u32 dim, u32 head_dim, f32 freq_base, RopeType type
 // y[out_dim] = w[out_dim, in_dim] @ x[in_dim] -- a GGUF weight tensor's
 // row-major layout is exactly (out_dim, in_dim), so this is a direct
 // row-dot-product, no transpose needed (see STDLIB.md / README limits for
-// why this isn't tensor.c's matmul()).
-void linear(f32* out, const f32* x, const f32* w, u32 in_dim, u32 out_dim);
+// why this isn't tensor.c's matmul()). Takes the Tensor itself, not a bare
+// pointer, because w may be lazy (see tensor.h) -- an eager tensor's rows
+// come straight out of w->data exactly as before; a lazy tensor's rows are
+// dequantized on demand, chunk by chunk, straight out of the mmap'd GGUF
+// file, never materialized in full.
+void linear(f32* out, const f32* x, const Tensor* w, u32 in_dim, u32 out_dim);
 
 // out[i] += bias[i] for i in 0..dim-1 -- applied after linear() when a
 // projection carries a bias (qwen2's attn_q/k/v; GPT-2's every projection,

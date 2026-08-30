@@ -167,26 +167,26 @@ void gpt2_forward_step(GPT2Model* model, KVCache* caches, u32 pos, u32 token_id,
         GPT2Layer* layer = &model->layers[l];
 
         layer_norm(xnorm, hidden, layer->attn_norm_w->data, layer->attn_norm_b->data, dim, model->cfg.ln_eps);
-        linear(qkv, xnorm, layer->attn_qkv_w->data, dim, 3 * dim);
+        linear(qkv, xnorm, layer->attn_qkv_w, dim, 3 * dim);
         add_bias(qkv, layer->attn_qkv_b->data, 3 * dim);
         f32* q = qkv; f32* k = qkv + dim; f32* v = qkv + 2 * dim; // fused QKV: contiguous slices, no RoPE to apply
 
         causal_mha(q, k, v, &caches[l], attn_out, pos, n_heads, n_heads, head_dim); // plain MHA == GQA with n_heads_kv == n_heads
-        linear(attn_proj, attn_out, layer->attn_out_w->data, dim, dim);
+        linear(attn_proj, attn_out, layer->attn_out_w, dim, dim);
         add_bias(attn_proj, layer->attn_out_b->data, dim);
         for (u32 d = 0; d < dim; d++) hidden[d] += attn_proj[d];
 
         layer_norm(xnorm, hidden, layer->ffn_norm_w->data, layer->ffn_norm_b->data, dim, model->cfg.ln_eps);
-        linear(ffn_hid, xnorm, layer->ffn_up_w->data, dim, ffn);
+        linear(ffn_hid, xnorm, layer->ffn_up_w, dim, ffn);
         add_bias(ffn_hid, layer->ffn_up_b->data, ffn);
         for (u32 d = 0; d < ffn; d++) ffn_hid[d] = gelu(ffn_hid[d]); // ungated: no gate tensor, unlike SwiGLU/GeGLU
-        linear(ffn_out, ffn_hid, layer->ffn_down_w->data, ffn, dim);
+        linear(ffn_out, ffn_hid, layer->ffn_down_w, ffn, dim);
         add_bias(ffn_out, layer->ffn_down_b->data, dim);
         for (u32 d = 0; d < dim; d++) hidden[d] += ffn_out[d];
     }
 
     layer_norm(xnorm, hidden, model->output_norm_w->data, model->output_norm_b->data, dim, model->cfg.ln_eps);
-    linear(logits_out, xnorm, model->lm_head->data, dim, model->cfg.vocab_size);
+    linear(logits_out, xnorm, model->lm_head, dim, model->cfg.vocab_size);
 
     free(hidden); free(xnorm); free(qkv); free(attn_out); free(attn_proj); free(ffn_hid); free(ffn_out);
 }
