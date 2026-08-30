@@ -35,6 +35,9 @@ u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
     f32* ffn_out   = (f32*)malloc(dim * sizeof(f32));
     f32* logits    = (f32*)malloc((u64)model->cfg.vocab_size * sizeof(f32));
 
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     for (u32 step = 0; step < max_gen_tokens; step++) {
         u32 current_pos = total_tokens - 1;
         u32 cur_tok = out_tokens[current_pos];
@@ -70,6 +73,13 @@ u32 generate_autoregressive(LLaMAModel* model, KVCache* caches,
         out_tokens[total_tokens++] = next_tok;
         if (next_tok == eos_id) break;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    u32 n_generated = total_tokens - in_token_count;
+    double elapsed = (double)(t_end.tv_sec - t_start.tv_sec) +
+                      (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+    if (n_generated > 0 && elapsed > 0.0)
+        fprintf(stderr, "[%u tokens in %.2fs, %.2f tok/s]\n", n_generated, elapsed, n_generated / elapsed);
 
     free(hidden); free(xnorm); free(q); free(k); free(v);
     free(attn_out); free(attn_proj); free(gate); free(up); free(ffn_hid); free(ffn_out); free(logits);
