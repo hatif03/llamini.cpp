@@ -4,6 +4,37 @@ Every place this project would normally reach for a package, and the libc/POSIX
 stand-in used instead. See [README.md](README.md) "Limits" for what each stand-in
 still can't do.
 
+## Package Killer: what this replaces
+
+Running a GGUF language model from scratch normally means installing at
+least one of these:
+
+| Package people actually install | Why | Replaced here by |
+| --- | --- | --- |
+| `ggml` / `llama.cpp` linked as a library | GGUF parsing, block dequantization, transformer kernels | `gguf.c` (header/metadata/tensor-info parser + `F32`/`F16`/`Q4_0`/`Q4_1`/`Q8_0`/`Q4_K`/`Q6_K` decoders), `model.c` (RMSNorm, RoPE, GQA attention, SwiGLU, `linear`) |
+| `llama-cpp-python`, `ctransformers` (pip) | Python bindings over the above | Not needed — the CLI *is* the binary |
+| `sentencepiece` (pip / libsentencepiece) | SPM-BPE encode/decode | `tokenizer.c`, driven entirely by the GGUF file's own `tokenizer.ggml.*` metadata |
+| `numpy` / a BLAS | tensor storage + matmul | `tensor.c` and `linear()` in `model.c` (pthread-parallelized, gcc-vectorized — see the flags row below) |
+
+### What this is NOT (scope, stated up front)
+
+- **Not a ggml reimplementation.** It implements the subset needed to load
+  and run one LLaMA-architecture `Q4_K_M` file, not ggml's graph engine,
+  backends, or full op set.
+- **Quantization coverage is partial:** `F32`, `F16`, `Q4_0`, `Q4_1`,
+  `Q8_0`, `Q4_K`, `Q6_K` only. `Q2_K`, `Q3_K`, `Q5_K`, `Q8_K`, and the `IQ*`
+  family are explicitly rejected (`-1`), never silently misread.
+- **Architecture coverage is LLaMA-only.** No Mistral/Phi/Qwen quirks, no
+  LoRA, no GPU, no batching.
+- **Not numerically verified against ggml.** No reference implementation
+  was run to cross-check outputs bit-for-bit. Correctness evidence is
+  `--bench`'s teacher-forced perplexity against a random-baseline ceiling
+  plus known-fact completions (measured **13.28** perplexity vs. a ~32000
+  ceiling, and "The capital of France is" -> "Paris." — see README's
+  "Correctness evidence"), not bit-exact comparison.
+
+## Substitution log
+
 | Instead of | Used | Rationale |
 | --- | --- | --- |
 | `ggml` / llama.cpp's GGUF loader | Hand-written binary parser in `gguf.c` (`open` + `mmap` + a bounds-checked cursor over the mapped bytes) | Parses the real GGUF layout: header, metadata key/value table (all 13 value types, including nested arrays), tensor-info table, alignment-padded tensor data section. Every multi-byte read is bounds-checked against the file size so a truncated/malformed file fails the parse instead of reading past the mapping. |

@@ -8,7 +8,11 @@ loads and runs an actual `TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf` file. Built
 for the Zero Dependency hackathon, Track F — libc and POSIX only, no
 third-party runtime dependency of any kind. See [STDLIB.md](STDLIB.md) for
 every package this project would normally reach for, and what stood in for
-it instead.
+it instead — including its ["Package Killer" section](STDLIB.md#package-killer-what-this-replaces),
+naming exactly what running a GGUF model normally requires installing
+(`ggml`/`llama.cpp`, `llama-cpp-python`, `sentencepiece`, a BLAS) and what
+replaces each one here, with an upfront, honest scope disclosure of what
+this project is *not*.
 
 ## Build and run
 
